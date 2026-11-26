@@ -116,13 +116,14 @@ If the preview cannot be created, fallback controls may be provided by the GNOME
 
 Open a screenshot in the built-in doodle and crop editor:
 
+- The rest of the screen dims behind the image while you edit, so it's visually obvious you're in a modal edit session rather than looking at an unchanged desktop.
 - Draw over the image with the mouse.
 - Change brush size and doodle colour.
 - Switch between doodle and crop modes with **C**.
 - Apply a selected crop rectangle with **Enter**.
-- **Ctrl+S** saves to the original file *without* exiting, so you can keep editing.
-- **Ctrl+C** copies the current image to the clipboard *without* exiting.
-- **Q** quits. Anything already written with Ctrl+S stays on disk; anything only in the canvas since the last Ctrl+S is discarded.
+- **Ctrl+S** saves to the original file and exits.
+- **Ctrl+C** copies the current image to the clipboard and exits.
+- **Q** quits without saving or copying.
 - Open the most recently saved screenshot by running `--edit` without a path.
 
 ### Video recording

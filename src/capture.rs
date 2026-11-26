@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,6 +21,10 @@ pub fn select_region() -> Result<Region> {
     let output = Command::new("slurp")
         .arg("-f")
         .arg("%x,%y %wx%h")
+        // Its own process group: a Ctrl+C sent to our foreground process
+        // group shouldn't also kill slurp directly (we handle the signal
+        // ourselves and shut things down in order).
+        .process_group(0)
         .output()
         .context("failed to run slurp")?;
     if !output.status.success() {
@@ -151,6 +156,14 @@ fn capture_frame_grim(region: &Region) -> Result<RgbaImage> {
         .arg("-s")
         .arg("1")
         .arg("-")
+        // During `--record`, grim is re-run for every frame. Without its own
+        // process group, a Ctrl+C sent to our foreground process group (the
+        // terminal delivers SIGINT to the whole group, not just us) kills
+        // whichever grim invocation happens to be in flight at that instant
+        // too, producing a spurious "grim exited with non-zero status" with
+        // empty stderr right as we're shutting down anyway. Isolating it
+        // lets us decide when to stop instead.
+        .process_group(0)
         .output()
         .context("failed to run grim")?;
     if !output.status.success() {

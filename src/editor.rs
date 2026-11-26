@@ -8,10 +8,9 @@
 //! - `c`: toggle crop mode.
 //! - Enter: apply the pending crop rectangle.
 //! - Escape: cancel a pending crop (or quit, if nothing is pending).
-//! - `Ctrl+S`: save (overwrites the original file) and keep editing.
-//! - `Ctrl+C`: copy the current image to the clipboard and keep editing.
-//! - `q`: quit. Anything already written via Ctrl+S stays on disk; anything
-//!   only in the in-memory canvas since the last Ctrl+S is discarded.
+//! - `Ctrl+S`: save (overwrites the original file) and exit.
+//! - `Ctrl+C`: copy the current image to the clipboard and exit.
+//! - `q`: quit without saving or copying.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +65,14 @@ const MIN_BRUSH_RADIUS: f32 = 2.0;
 const MAX_BRUSH_RADIUS: f32 = 60.0;
 const BRUSH_STEP: f32 = 2.0;
 
+/// Dim backdrop (BGRA byte order, matching the icons' darkest gradient stop)
+/// shown around the image while editing, over the whole output - so it's
+/// visually obvious a modal edit session is active instead of the editor
+/// quietly floating over an unchanged desktop. The surface is still a
+/// translucent overlay rather than solid black, so the desktop underneath
+/// visibly *darkens* rather than disappears.
+const BACKDROP_BGRA: [u8; 4] = [0x41, 0x03, 0x08, 222];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Doodle,
@@ -102,20 +109,28 @@ pub fn run(path: &Path) -> Result<()> {
         Some("Wayutils-Screen-editor"),
         None,
     );
-    // No anchor on either axis: wlr-layer-shell centers the surface on the
-    // output for us, so we don't need to compute margins by hand.
-    layer.set_anchor(Anchor::empty());
+    // Anchored to all four edges, spanning the whole output: the image
+    // itself is centered within this by `compute_image_placement`, and the
+    // rest is filled with a dim backdrop (see `build_display_buffer`) so the
+    // desktop visibly darkens behind the editor instead of the editor
+    // quietly floating over an otherwise-unchanged screen.
+    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     layer.set_exclusive_zone(-1);
 
-    let (display_w, display_h, scale) = fit_to_output(canvas.width(), canvas.height(), max_output);
-    layer.set_size(display_w, display_h);
+    let (surface_w, surface_h) = max_output;
+    layer.set_size(surface_w, surface_h);
     layer.commit();
 
-    let pool = SlotPool::new((display_w * display_h * 4).max(4) as usize, &shm)
+    let (image_w, image_h, offset_x, offset_y, scale) =
+        compute_image_placement(canvas.width(), canvas.height(), surface_w, surface_h);
+
+    let pool = SlotPool::new((surface_w * surface_h * 4).max(4) as usize, &shm)
         .context("failed to create shm pool")?;
 
-    let display_buffer = build_display_buffer(&canvas, display_w, display_h, scale);
+    let display_buffer = build_display_buffer(
+        &canvas, surface_w, surface_h, image_w, image_h, offset_x, offset_y, scale,
+    );
 
     let mut state = EditorState {
         registry_state: RegistryState::new(&globals),
@@ -124,11 +139,16 @@ pub fn run(path: &Path) -> Result<()> {
         shm,
         pool,
         layer,
-        display_w,
-        display_h,
+        display_w: surface_w,
+        display_h: surface_h,
+        image_w,
+        image_h,
+        offset_x,
+        offset_y,
         max_output,
         configured: false,
         exit: false,
+        saved_or_copied: false,
         path: path.to_path_buf(),
         canvas,
         scale,
@@ -153,8 +173,8 @@ pub fn run(path: &Path) -> Result<()> {
 
     eprintln!(
         "Edit mode: drag to doodle | Up/Down brush size | Left/Right color | c crop | \
-         Enter confirm crop | Esc cancel crop/quit | Ctrl+S save (keep editing) | \
-         Ctrl+C copy to clipboard (keep editing) | q quit"
+         Enter confirm crop | Esc cancel crop/quit | Ctrl+S save & exit | \
+         Ctrl+C copy to clipboard & exit | q quit without saving"
     );
 
     loop {
@@ -171,55 +191,99 @@ pub fn run(path: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(8));
     }
 
-    eprintln!("Exited the editor. (Ctrl+S saves immediately while editing; quitting does not save.)");
+    if !state.saved_or_copied {
+        eprintln!("Exited without saving.");
+    }
 
     Ok(())
 }
 
-/// Builds a full display-resolution (BGRA byte order) copy of `canvas`,
-/// nearest-neighbour scaled. Parallelized by row with rayon since this is
-/// O(display pixels) - only used for the rare full rebuilds (initial load,
-/// after a crop), never on every mouse move.
-fn build_display_buffer(canvas: &RgbaImage, dst_w: u32, dst_h: u32, scale: f32) -> Vec<u8> {
-    let mut buf = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+/// Builds a full surface-resolution (BGRA byte order) frame: the whole
+/// `surface_w`×`surface_h` output filled with [`BACKDROP_BGRA`], with
+/// `canvas` nearest-neighbour scaled to `image_w`×`image_h` and blitted in,
+/// centered at `(offset_x, offset_y)`. Parallelized by row with rayon since
+/// this is O(surface pixels) - only used for the rare full rebuilds (initial
+/// load, after a crop, a compositor resize), never on every mouse move.
+#[allow(clippy::too_many_arguments)]
+fn build_display_buffer(
+    canvas: &RgbaImage,
+    surface_w: u32,
+    surface_h: u32,
+    image_w: u32,
+    image_h: u32,
+    offset_x: u32,
+    offset_y: u32,
+    scale: f32,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; (surface_w as usize) * (surface_h as usize) * 4];
+    for px in buf.chunks_exact_mut(4) {
+        px.copy_from_slice(&BACKDROP_BGRA);
+    }
+
     let cw = canvas.width();
     let ch = canvas.height();
-    if cw == 0 || ch == 0 || dst_w == 0 || dst_h == 0 {
+    if cw == 0 || ch == 0 || image_w == 0 || image_h == 0 {
         return buf;
     }
     let inv_scale = 1.0 / scale.max(0.0001);
     let src = canvas.as_raw();
-    let stride = (dst_w as usize) * 4;
+    let surface_stride = (surface_w as usize) * 4;
+    let image_bottom = (offset_y + image_h) as usize;
+    let image_right = (offset_x + image_w) as usize;
 
-    buf.par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
-        let sy = ((y as f32 * inv_scale) as u32).min(ch - 1);
-        let src_row = (sy * cw * 4) as usize;
-        for x in 0..dst_w as usize {
-            let sx = ((x as f32 * inv_scale) as u32).min(cw - 1) as usize;
-            let src_idx = src_row + sx * 4;
-            let dst_idx = x * 4;
-            if src_idx + 3 < src.len() && dst_idx + 3 < row.len() {
-                row[dst_idx] = src[src_idx + 2]; // B
-                row[dst_idx + 1] = src[src_idx + 1]; // G
-                row[dst_idx + 2] = src[src_idx]; // R
-                row[dst_idx + 3] = src[src_idx + 3]; // A
+    buf.par_chunks_mut(surface_stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            if y < offset_y as usize || y >= image_bottom {
+                return;
             }
-        }
-    });
+            let iy = y as u32 - offset_y;
+            let sy = ((iy as f32 * inv_scale) as u32).min(ch - 1);
+            let src_row = (sy * cw * 4) as usize;
+            for x in offset_x as usize..image_right.min(surface_w as usize) {
+                let ix = (x - offset_x as usize) as u32;
+                let sx = ((ix as f32 * inv_scale) as u32).min(cw - 1) as usize;
+                let src_idx = src_row + sx * 4;
+                let dst_idx = x * 4;
+                if src_idx + 3 < src.len() && dst_idx + 3 < row.len() {
+                    row[dst_idx] = src[src_idx + 2]; // B
+                    row[dst_idx + 1] = src[src_idx + 1]; // G
+                    row[dst_idx + 2] = src[src_idx]; // R
+                    row[dst_idx + 3] = src[src_idx + 3]; // A
+                }
+            }
+        });
 
     buf
 }
 
-/// Returns `(display_width, display_height, scale)` so the image fits inside
+/// Returns `(image_width, image_height, scale)` so the image fits inside
 /// `max_output`, never upscaled beyond 1:1.
 fn fit_to_output(img_w: u32, img_h: u32, max_output: (u32, u32)) -> (u32, u32, f32) {
     let scale = (max_output.0 as f32 / img_w.max(1) as f32)
         .min(max_output.1 as f32 / img_h.max(1) as f32)
         .min(1.0)
         .max(0.01);
-    let display_w = ((img_w as f32) * scale).round().max(1.0) as u32;
-    let display_h = ((img_h as f32) * scale).round().max(1.0) as u32;
-    (display_w, display_h, scale)
+    let image_w = ((img_w as f32) * scale).round().max(1.0) as u32;
+    let image_h = ((img_h as f32) * scale).round().max(1.0) as u32;
+    (image_w, image_h, scale)
+}
+
+/// Fits `canvas_w`×`canvas_h` inside the full `surface_w`×`surface_h`
+/// Wayland surface (the whole output) and centers it there, returning
+/// `(image_w, image_h, offset_x, offset_y, scale)`. The leftover space
+/// around the image is where [`build_display_buffer`] paints the dim
+/// backdrop.
+fn compute_image_placement(
+    canvas_w: u32,
+    canvas_h: u32,
+    surface_w: u32,
+    surface_h: u32,
+) -> (u32, u32, u32, u32, f32) {
+    let (image_w, image_h, scale) = fit_to_output(canvas_w, canvas_h, (surface_w, surface_h));
+    let offset_x = surface_w.saturating_sub(image_w) / 2;
+    let offset_y = surface_h.saturating_sub(image_h) / 2;
+    (image_w, image_h, offset_x, offset_y, scale)
 }
 
 struct EditorState {
@@ -230,11 +294,23 @@ struct EditorState {
     pool: SlotPool,
     layer: LayerSurface,
 
+    /// The whole Wayland surface (the full output), not just the image -
+    /// anchored to all four edges so the dim backdrop covers the real
+    /// desktop all the way to its corners.
     display_w: u32,
     display_h: u32,
+    /// The scaled image's own size and its centered position within the
+    /// surface. Everything outside this rect is [`BACKDROP_BGRA`].
+    image_w: u32,
+    image_h: u32,
+    offset_x: u32,
+    offset_y: u32,
     max_output: (u32, u32),
     configured: bool,
     exit: bool,
+    /// Set by `quick_save`/`quick_copy` so the final message on exit doesn't
+    /// also claim nothing was saved.
+    saved_or_copied: bool,
 
     /// The file this editor was opened on; `Ctrl+S` overwrites this path.
     path: PathBuf,
@@ -282,10 +358,23 @@ impl EditorState {
 
     fn to_canvas_point(&self, position: (f64, f64)) -> (f32, f32) {
         let scale = self.scale.max(0.0001);
+        let local_x = position.0 as f32 - self.offset_x as f32;
+        let local_y = position.1 as f32 - self.offset_y as f32;
         (
-            (position.0 as f32 / scale).clamp(0.0, self.canvas.width().max(1) as f32 - 1.0),
-            (position.1 as f32 / scale).clamp(0.0, self.canvas.height().max(1) as f32 - 1.0),
+            (local_x / scale).clamp(0.0, self.canvas.width().max(1) as f32 - 1.0),
+            (local_y / scale).clamp(0.0, self.canvas.height().max(1) as f32 - 1.0),
         )
+    }
+
+    /// Whether a surface-local pointer position falls on the image itself,
+    /// rather than the dim backdrop around it - used to stop clicks in the
+    /// margin from doodling/cropping at the image's nearest edge pixel.
+    fn position_within_image(&self, position: (f64, f64)) -> bool {
+        let (x, y) = position;
+        x >= self.offset_x as f64
+            && y >= self.offset_y as f64
+            && x < (self.offset_x + self.image_w) as f64
+            && y < (self.offset_y + self.image_h) as f64
     }
 
     fn paint_dot(&mut self, pt: (f32, f32)) {
@@ -335,10 +424,10 @@ impl EditorState {
         let dy0 = (y0 * scale).floor().max(0.0) as u32;
         let dx1 = ((x1 * scale).ceil().max(0.0) as u32)
             .saturating_add(1)
-            .min(self.display_w);
+            .min(self.image_w);
         let dy1 = ((y1 * scale).ceil().max(0.0) as u32)
             .saturating_add(1)
-            .min(self.display_h);
+            .min(self.image_h);
         if dx1 <= dx0 || dy1 <= dy0 {
             return;
         }
@@ -349,16 +438,17 @@ impl EditorState {
             return;
         }
         let inv_scale = 1.0 / scale;
-        let dst_w = self.display_w;
+        let surface_w = self.display_w;
+        let (offset_x, offset_y) = (self.offset_x, self.offset_y);
         let src = self.canvas.as_raw();
         for y in dy0..dy1 {
             let sy = ((y as f32 * inv_scale) as u32).min(ch - 1);
-            let dst_row = (y as usize) * (dst_w as usize) * 4;
+            let dst_row = ((y + offset_y) as usize) * (surface_w as usize) * 4;
             let src_row = (sy * cw * 4) as usize;
             for x in dx0..dx1 {
                 let sx = ((x as f32 * inv_scale) as u32).min(cw - 1);
                 let src_idx = src_row + (sx * 4) as usize;
-                let dst_idx = dst_row + (x as usize) * 4;
+                let dst_idx = dst_row + ((x + offset_x) as usize) * 4;
                 if src_idx + 3 < src.len() && dst_idx + 3 < self.display_buffer.len() {
                     self.display_buffer[dst_idx] = src[src_idx + 2];
                     self.display_buffer[dst_idx + 1] = src[src_idx + 1];
@@ -389,36 +479,59 @@ impl EditorState {
         self.recompute_layout(qh);
     }
 
-    /// `Ctrl+S`: overwrites the original file with the current canvas,
-    /// without exiting the editor so doodling/cropping can continue.
+    /// `Ctrl+S`: overwrites the original file with the current canvas, then
+    /// exits the editor (there's nothing left to do once it's saved).
     fn quick_save(&mut self) {
         let format = crate::output::format_for_path(&self.path);
         match self.canvas.save_with_format(&self.path, format) {
-            Ok(()) => eprintln!("Saved to {}", self.path.display()),
+            Ok(()) => {
+                eprintln!("Saved to {}", self.path.display());
+                self.saved_or_copied = true;
+            }
             Err(err) => eprintln!("Failed to save {}: {err}", self.path.display()),
         }
+        self.exit = true;
     }
 
-    /// `Ctrl+C`: copies the current canvas to the clipboard, without exiting
-    /// the editor so doodling/cropping can continue.
+    /// `Ctrl+C`: copies the current canvas to the clipboard, then exits the
+    /// editor (there's nothing left to do once it's copied).
     fn quick_copy(&mut self) {
         match crate::output::copy_to_clipboard(Arc::new(self.canvas.clone())) {
-            Ok(()) => eprintln!("Copied to clipboard"),
+            Ok(()) => {
+                eprintln!("Copied to clipboard");
+                self.saved_or_copied = true;
+            }
             Err(err) => eprintln!("Failed to copy to clipboard: {err}"),
         }
+        self.exit = true;
     }
 
+    /// Called after a crop changes the canvas's own size. The Wayland
+    /// surface itself stays at the full output size (so the dim backdrop
+    /// keeps covering the whole screen) - only the image's placement within
+    /// it changes.
     fn recompute_layout(&mut self, qh: &QueueHandle<Self>) {
-        let (display_w, display_h, scale) =
-            fit_to_output(self.canvas.width(), self.canvas.height(), self.max_output);
-        self.display_w = display_w;
-        self.display_h = display_h;
+        let (image_w, image_h, offset_x, offset_y, scale) = compute_image_placement(
+            self.canvas.width(),
+            self.canvas.height(),
+            self.display_w,
+            self.display_h,
+        );
+        self.image_w = image_w;
+        self.image_h = image_h;
+        self.offset_x = offset_x;
+        self.offset_y = offset_y;
         self.scale = scale;
-        // The canvas size changed (crop), so the whole display buffer needs
-        // rebuilding - this happens once per crop, not per mouse move.
-        self.display_buffer = build_display_buffer(&self.canvas, display_w, display_h, scale);
-        self.layer.set_size(display_w, display_h);
-        self.layer.commit();
+        self.display_buffer = build_display_buffer(
+            &self.canvas,
+            self.display_w,
+            self.display_h,
+            image_w,
+            image_h,
+            offset_x,
+            offset_y,
+            scale,
+        );
         self.request_redraw(qh);
     }
 
@@ -481,7 +594,16 @@ impl EditorState {
             }
             Mode::Crop => {
                 if let (Some(a), Some(b)) = (self.crop_start, self.crop_current) {
-                    draw_crop_rect(canvas_buf, self.display_w, self.display_h, a, b, self.scale);
+                    draw_crop_rect(
+                        canvas_buf,
+                        self.display_w,
+                        self.display_h,
+                        a,
+                        b,
+                        self.scale,
+                        self.offset_x as f32,
+                        self.offset_y as f32,
+                    );
                 }
             }
         }
@@ -591,20 +713,32 @@ fn draw_brush_ring(dst: &mut [u8], width: u32, height: u32, center: (f64, f64), 
 }
 
 /// Draws the pending crop rectangle outline, in canvas coordinates mapped to
-/// display coordinates via `scale`. Only allocates a pixmap sized to the
-/// rectangle's own bounding box (plus a little stroke padding), not the
-/// whole display surface, so dragging a crop box stays cheap too.
-fn draw_crop_rect(dst: &mut [u8], width: u32, height: u32, a: (f32, f32), b: (f32, f32), scale: f32) {
+/// display coordinates via `scale` then shifted by `(offset_x, offset_y)`
+/// (the image's centered position within the full-output surface). Only
+/// allocates a pixmap sized to the rectangle's own bounding box (plus a
+/// little stroke padding), not the whole display surface, so dragging a crop
+/// box stays cheap too.
+#[allow(clippy::too_many_arguments)]
+fn draw_crop_rect(
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+    a: (f32, f32),
+    b: (f32, f32),
+    scale: f32,
+    offset_x: f32,
+    offset_y: f32,
+) {
     if width == 0 || height == 0 {
         return;
     }
 
     let stroke_w = 2.0f32;
     let pad = stroke_w + 2.0;
-    let x0 = (a.0.min(b.0) * scale).max(0.0);
-    let y0 = (a.1.min(b.1) * scale).max(0.0);
-    let x1 = (a.0.max(b.0) * scale).min(width as f32);
-    let y1 = (a.1.max(b.1) * scale).min(height as f32);
+    let x0 = (a.0.min(b.0) * scale + offset_x).max(0.0);
+    let y0 = (a.1.min(b.1) * scale + offset_y).max(0.0);
+    let x1 = (a.0.max(b.0) * scale + offset_x).min(width as f32);
+    let y1 = (a.1.max(b.1) * scale + offset_y).min(height as f32);
 
     let px0 = (x0 - pad).max(0.0);
     let py0 = (y0 - pad).max(0.0);
@@ -726,25 +860,32 @@ impl LayerShellHandler for EditorState {
             (self.display_w, self.display_h)
         };
 
-        // Some compositors configure an unanchored overlay surface to a size
-        // other than the one we requested (or, on the very first configure,
-        // may not yet match the size `run()` computed before any roundtrip).
-        // `display_buffer` is a cache pre-scaled to a *specific* display
-        // size, so if we only updated `display_w`/`display_h` here without
-        // rebuilding it, `draw()` would find a length mismatch, log a
-        // warning and blank the surface - which is exactly why the
-        // screenshot wouldn't show up. Re-fit and rebuild the cache for
-        // whatever size the compositor actually assigned.
+        // The compositor may configure the fullscreen-anchored surface to a
+        // size other than the output rect we probed (or, on the very first
+        // configure, may not yet match the size `run()` assumed before any
+        // roundtrip). `display_buffer` is a cache sized for a *specific*
+        // surface size, so if we only updated `display_w`/`display_h` here
+        // without rebuilding it, `draw()` would find a length mismatch, log
+        // a warning and blank the surface - which is exactly why the
+        // screenshot wouldn't show up. Re-fit the image and rebuild the
+        // cache for whatever size the compositor actually assigned.
         if assigned_size != (self.display_w, self.display_h) || !self.configured {
-            let (display_w, display_h, scale) =
-                fit_to_output(self.canvas.width(), self.canvas.height(), assigned_size);
-            self.display_w = display_w;
-            self.display_h = display_h;
+            let (surface_w, surface_h) = (assigned_size.0.max(1), assigned_size.1.max(1));
+            let (image_w, image_h, offset_x, offset_y, scale) =
+                compute_image_placement(self.canvas.width(), self.canvas.height(), surface_w, surface_h);
+            self.display_w = surface_w;
+            self.display_h = surface_h;
+            self.image_w = image_w;
+            self.image_h = image_h;
+            self.offset_x = offset_x;
+            self.offset_y = offset_y;
             self.scale = scale;
-            self.display_buffer = build_display_buffer(&self.canvas, display_w, display_h, scale);
-            // Tell the compositor our actual (aspect-correct) size back, in
-            // case it differs from what it just assigned us.
-            self.layer.set_size(display_w, display_h);
+            self.display_buffer = build_display_buffer(
+                &self.canvas, surface_w, surface_h, image_w, image_h, offset_x, offset_y, scale,
+            );
+            // Tell the compositor our actual size back, in case it differs
+            // from what it just assigned us.
+            self.layer.set_size(surface_w, surface_h);
         }
 
         self.configured = true;
@@ -936,18 +1077,23 @@ impl PointerHandler for EditorState {
             match event.kind {
                 PointerEventKind::Press { .. } => {
                     self.pointer_down = true;
-                    let canvas_pt = self.to_canvas_point(event.position);
-                    match self.mode {
-                        Mode::Doodle => {
-                            self.paint_dot(canvas_pt);
-                            self.last_canvas_point = Some(canvas_pt);
+                    // A click on the dim backdrop around the image (rather
+                    // than the image itself) shouldn't doodle or start a
+                    // crop at the image's nearest edge pixel.
+                    if self.position_within_image(event.position) {
+                        let canvas_pt = self.to_canvas_point(event.position);
+                        match self.mode {
+                            Mode::Doodle => {
+                                self.paint_dot(canvas_pt);
+                                self.last_canvas_point = Some(canvas_pt);
+                            }
+                            Mode::Crop => {
+                                self.crop_start = Some(canvas_pt);
+                                self.crop_current = Some(canvas_pt);
+                            }
                         }
-                        Mode::Crop => {
-                            self.crop_start = Some(canvas_pt);
-                            self.crop_current = Some(canvas_pt);
-                        }
+                        self.request_redraw(qh);
                     }
-                    self.request_redraw(qh);
                 }
                 PointerEventKind::Release { .. } => {
                     self.pointer_down = false;

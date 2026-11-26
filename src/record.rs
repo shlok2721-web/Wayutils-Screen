@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,8 +153,12 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
         let tick_start = Instant::now();
         let normalized = normalize_frame(&frame, capture_w, capture_h);
         if stdin.write_all(normalized.as_raw()).is_err() {
-            log::warn!("ffmpeg stdin closed unexpectedly; stopping recording");
-            encode_failed = true;
+            // A broken pipe right as we're already stopping (Ctrl+C/Enter)
+            // just means ffmpeg got there first - not a real failure.
+            if !should_stop(&stop_from_stdin) {
+                log::warn!("ffmpeg stdin closed unexpectedly; stopping recording");
+                encode_failed = true;
+            }
             break;
         }
         frame_count += 1;
@@ -363,6 +368,15 @@ fn spawn_ffmpeg(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::inherit());
+    // Its own process group: the terminal delivers Ctrl+C's SIGINT to the
+    // whole foreground process group, so without this ffmpeg receives the
+    // signal directly (at the same moment we do) and - by ffmpeg's own
+    // design - reports a non-zero "Exiting normally, received signal 2"
+    // exit code even when the file it wrote is perfectly valid. Isolating
+    // it means only *we* get the signal; we then stop feeding frames and
+    // close its stdin ourselves, giving ffmpeg the same clean EOF-triggered
+    // shutdown (exit code 0) as pressing Enter already did.
+    cmd.process_group(0);
     cmd.spawn().context("failed to spawn ffmpeg")
 }
 
