@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Wayutils-Screen
+GenericName=Scrolling Screenshot
+Comment=Capture and stitch scrolling screenshots on Wayland
+Exec=Wayutils-Screen
+Icon=wayutils-screen
+Terminal=false
+Categories=Graphics;Utility;
+StartupNotify=false
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+
+<defs>
+  <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#302B78"/>
+    <stop offset="0.52" stop-color="#17105D"/>
+    <stop offset="1" stop-color="#080341"/>
+  </linearGradient>
+  <linearGradient id="highlight" x1="0" y1="0" x2="0.9" y2="1">
+    <stop offset="0" stop-color="#A9A4FF" stop-opacity=".72"/>
+    <stop offset="1" stop-color="#625BCA" stop-opacity=".08"/>
+  </linearGradient>
+  <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#C7C3FF" stop-opacity=".78"/>
+    <stop offset="1" stop-color="#6C65D4" stop-opacity=".22"/>
+  </linearGradient>
+  <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+    <feGaussianBlur stdDeviation="3.2" result="blur"/>
+    <feColorMatrix in="blur" type="matrix"
+      values="0 0 0 0 0.34  0 0 0 0 0.30  0 0 0 0 0.92  0 0 0 .28 0" result="tint"/>
+    <feMerge><feMergeNode in="tint"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>
+
+<g filter="url(#glow)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M66 20H34a9 9 0 0 0-9 9v70a9 9 0 0 0 9 9h32" stroke="url(#edge)" stroke-width="7"/>
+  <path d="M61 64h48m-18-18 18 18-18 18" stroke="url(#body)" stroke-width="12"/>
+  <path d="M61 64h48m-18-18 18 18-18 18" stroke="#A9A4FF" stroke-opacity=".88" stroke-width="5"/>
+  <path d="M39 32v64" stroke="#A9A4FF" stroke-opacity=".2" stroke-width="2"/>
+</g></svg>

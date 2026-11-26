@@ -1,0 +1,7 @@
+{
+  "uuid": "Wayutils-Screen-scroll-helper@snemc.org",
+  "name": "Wayutils-Screen Scroll Helper",
+  "description": "Lets Wayutils-Screen select a region and capture frames on GNOME, which does not provide wlr-layer-shell.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/shlok2721-web/Wayutils-Screen"
+}

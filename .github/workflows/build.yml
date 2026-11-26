@@ -1,0 +1,106 @@
+
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENCV_PKGCONFIG_NAME: opencv5
+
+jobs:
+  build-archlinux:
+    name: Build Arch Linux x86_64
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm \
+            base-devel \
+            clang \
+            git \
+            libxkbcommon \
+            nodejs \
+            opencv \
+            pkgconf \
+            rust \
+            zip
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: archlinux-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            archlinux-x86_64-cargo-
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Prepare binary
+        run: |
+          mkdir -p release
+          install -Dm755 target/release/Wayutils-Screen \
+            release/Wayutils-Screen
+          install -Dm644 Wayutils-Screen.desktop \
+            release/Wayutils-Screen.desktop
+          install -Dm644 assets/wayutils-screen.svg \
+            release/wayutils-screen.svg
+          install -Dm644 README.md release/README.md
+          install -Dm644 LICENSE release/LICENSE
+          mkdir -p release/gnome-extension
+          cp -a packaging/gnome-extension/Wayutils-Screen-scroll-helper@snemc.org \
+            release/gnome-extension/
+
+      - name: Upload Arch Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wayutils-Screen-archlinux-x86_64
+          path: release/Wayutils-Screen
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd release
+          zip -qr Wayutils-Screen-archlinux-x86_64.zip \
+            Wayutils-Screen \
+            Wayutils-Screen.desktop \
+            wayutils-screen.svg \
+            README.md \
+            LICENSE \
+            gnome-extension
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/Wayutils-Screen-archlinux-x86_64.zip
+          generate_release_notes: true

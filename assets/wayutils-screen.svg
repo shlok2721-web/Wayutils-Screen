@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+<title id="title">Wayutils Screen app icon</title>
+<desc id="desc">A bold abstract scrolling capture mark formed by two seamlessly joined, offset glass panels inside a rounded dark app tile.</desc>
+<defs>
+  <linearGradient id="tile" x1="64" y1="28" x2="454" y2="488" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#202D55"/>
+    <stop offset=".55" stop-color="#111C3B"/>
+    <stop offset="1" stop-color="#091329"/>
+  </linearGradient>
+  <linearGradient id="panelA" x1="139" y1="103" x2="360" y2="303" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#9AF5E5"/>
+    <stop offset=".48" stop-color="#45DCCB"/>
+    <stop offset="1" stop-color="#21AFC1"/>
+  </linearGradient>
+  <linearGradient id="panelB" x1="362" y1="227" x2="164" y2="431" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#8BA8FF"/>
+    <stop offset=".52" stop-color="#6479F4"/>
+    <stop offset="1" stop-color="#4756C9"/>
+  </linearGradient>
+  <linearGradient id="seam" x1="145" y1="253" x2="369" y2="275" gradientUnits="userSpaceOnUse">
+    <stop stop-color="#E6FFFA"/>
+    <stop offset=".5" stop-color="#FFFFFF"/>
+    <stop offset="1" stop-color="#C6D2FF"/>
+  </linearGradient>
+  <filter id="shadow" x="64" y="53" width="390" height="421" filterUnits="userSpaceOnUse">
+    <feGaussianBlur stdDeviation="17"/>
+  </filter>
+  <filter id="softGlow" x="75" y="60" width="360" height="390" filterUnits="userSpaceOnUse">
+    <feGaussianBlur stdDeviation="10" result="b"/>
+    <feColorMatrix in="b" type="matrix" values="0 0 0 0 .18 0 0 0 0 .68 0 0 0 0 .85 0 0 0 .3 0"/>
+  </filter>
+  <clipPath id="topClip"><rect x="116" y="88" width="280" height="282" rx="58"/></clipPath>
+  <clipPath id="bottomClip"><rect x="116" y="214" width="280" height="210" rx="58"/></clipPath>
+</defs>
+
+<!-- Deep, softly lit app tile -->
+<rect x="12" y="12" width="488" height="488" rx="112" fill="url(#tile)"/>
+<circle cx="256" cy="243" r="170" fill="#5269D9" opacity=".08"/>
+<path d="M74 152C111 78 180 48 251 49" fill="none" stroke="#A7F8EC" stroke-opacity=".12" stroke-width="3" stroke-linecap="round"/>
+
+<!-- Cast shadow -->
+<rect x="116" y="100" width="280" height="324" rx="58" fill="#02091A" opacity=".58" filter="url(#shadow)"/>
+
+<!-- Back/top capture segment -->
+<g clip-path="url(#topClip)">
+  <rect x="116" y="88" width="280" height="282" rx="58" fill="url(#panelA)"/>
+  <path d="M143 116H331Q369 116 369 154V218" fill="none" stroke="#F1FFFC" stroke-opacity=".58" stroke-width="5" stroke-linecap="round"/>
+  <!-- Abstract content bands, not text lines -->
+  <rect x="157" y="151" width="128" height="17" rx="8.5" fill="#F1FFFC" opacity=".72"/>
+  <rect x="157" y="184" width="195" height="12" rx="6" fill="#E8FFFA" opacity=".40"/>
+  <rect x="157" y="207" width="162" height="12" rx="6" fill="#E8FFFA" opacity=".40"/>
+</g>
+
+<!-- Front/lower segment overlaps the first to imply continuous scrolling -->
+<g clip-path="url(#bottomClip)">
+  <rect x="116" y="214" width="280" height="210" rx="58" fill="url(#panelB)"/>
+  <path d="M143 244H331Q369 244 369 282V387" fill="none" stroke="#F1F3FF" stroke-opacity=".50" stroke-width="5" stroke-linecap="round"/>
+  <rect x="157" y="282" width="180" height="15" rx="7.5" fill="#F4F5FF" opacity=".68"/>
+  <rect x="157" y="314" width="195" height="11" rx="5.5" fill="#E9EDFF" opacity=".36"/>
+  <rect x="157" y="337" width="145" height="11" rx="5.5" fill="#E9EDFF" opacity=".36"/>
+</g>
+
+<!-- The joining seam is the visual shorthand for stitching -->
+<path d="M117 250H395" stroke="#07142C" stroke-opacity=".18" stroke-width="15"/>
+<path d="M128 250H384" stroke="url(#seam)" stroke-width="5" stroke-linecap="round" opacity=".96"/>
+<path d="M146 260H366" stroke="#FFFFFF" stroke-opacity=".16" stroke-width="2" stroke-linecap="round"/>
+
+<!-- Crisp silhouette accents -->
+<rect x="116.5" y="88.5" width="279" height="335" rx="57.5" fill="none" stroke="#FFFFFF" stroke-opacity=".18" stroke-width="2"/>
+<path d="M143 98H300" stroke="#FFFFFF" stroke-opacity=".52" stroke-width="3" stroke-linecap="round"/>
+</svg>
