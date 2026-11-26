@@ -105,9 +105,10 @@ pub struct Args {
     #[arg(long, value_name = "WxH", value_parser = parse_resolution)]
     pub resolution: Option<(u32, u32)>,
 
-    /// With --record, the recording frame rate.
-    #[arg(long, default_value_t = 12)]
-    pub fps: u32,
+    /// With --record, the recording frame rate (defaults to the value in
+    /// config.toml's [recording] fps, or 12 if that is also unset).
+    #[arg(long)]
+    pub fps: Option<u32>,
 }
 
 impl Args {

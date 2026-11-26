@@ -12,7 +12,15 @@ use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbaImage};
 ///
 /// 显式路径可以没有扩展名（如 `-o /tmp/focus`），此时按 PNG 编码并写入该确切路径；
 /// 路径是已存在的目录时，在其中生成带时间戳的文件。
-pub fn save_image(image: Arc<RgbaImage>, output_path: Option<PathBuf>) -> Result<PathBuf> {
+///
+/// `configured_dir` is the `[paths] image_dir` from `config.toml`, used only
+/// when `output_path` is `None`; it overrides the built-in
+/// `~/Pictures/Wayutils-Screen` default.
+pub fn save_image(
+    image: Arc<RgbaImage>,
+    output_path: Option<PathBuf>,
+    configured_dir: Option<&Path>,
+) -> Result<PathBuf> {
     let path = match output_path {
         Some(p) => {
             let p = if p.is_dir() {
@@ -28,7 +36,9 @@ pub fn save_image(image: Arc<RgbaImage>, output_path: Option<PathBuf>) -> Result
             p
         }
         None => {
-            let output_dir = default_output_dir();
+            let output_dir = configured_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(default_output_dir);
             std::fs::create_dir_all(&output_dir)?;
             output_dir.join(timestamped_filename())
         }
@@ -125,8 +135,13 @@ fn default_output_dir() -> PathBuf {
 /// Finds the most recently modified screenshot in the default screenshots
 /// folder, so `--edit` with no explicit path edits the screenshot you just
 /// took instead of silently falling through to a brand new capture.
-pub(crate) fn latest_screenshot_path() -> Result<PathBuf> {
-    let dir = default_output_dir();
+///
+/// `configured_dir` is the `[paths] image_dir` from `config.toml`; when set,
+/// it is searched instead of the built-in `~/Pictures/Wayutils-Screen`.
+pub fn latest_screenshot_path(configured_dir: Option<&Path>) -> Result<PathBuf> {
+    let dir = configured_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_output_dir);
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
 
     let entries = std::fs::read_dir(&dir)
@@ -186,7 +201,7 @@ mod tests {
     fn saves_extensionless_path_as_png_at_exact_path() {
         let dir = std::env::temp_dir().join(format!("wss-test-{}", std::process::id()));
         let target = dir.join("focus");
-        let out = save_image(Arc::new(RgbaImage::new(4, 4)), Some(target.clone())).unwrap();
+        let out = save_image(Arc::new(RgbaImage::new(4, 4)), Some(target.clone()), None).unwrap();
 
         assert_eq!(out, target);
         let bytes = std::fs::read(&target).unwrap();
@@ -198,7 +213,7 @@ mod tests {
     fn existing_directory_gets_timestamped_file() {
         let dir = std::env::temp_dir().join(format!("wss-test-dir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let out = save_image(Arc::new(RgbaImage::new(4, 4)), Some(dir.clone())).unwrap();
+        let out = save_image(Arc::new(RgbaImage::new(4, 4)), Some(dir.clone()), None).unwrap();
 
         assert_eq!(out.parent(), Some(dir.as_path()));
         assert!(out.is_file());

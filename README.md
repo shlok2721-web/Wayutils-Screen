@@ -99,14 +99,18 @@ The default algorithm is `opencv-orb`. Results depend on the content being captu
 
 ### Preview and controls
 
-When the preview overlay is available, its controls provide:
+When the preview overlay is available, its control bar has six buttons:
 
 - **Save** — write the stitched image to the selected output path.
 - **Copy** — copy the image to the clipboard.
+- **Edit** — finish the capture and open the result directly in the built-in editor.
+- **Record** — finish the capture and immediately start recording the same region as a video.
 - **Pause / Resume** — temporarily stop or continue capture.
-- **Cancel** — stop the current capture without saving.
+- **Quit** — stop the current capture without saving.
 
-If the preview cannot be created, fallback controls may be provided by the GNOME helper or an interactive terminal.
+Keyboard shortcuts work the same overlay: **Ctrl+S** saves, **Ctrl+C** copies, **E** jumps to the editor, **R** jumps to recording, **Space** pauses/resumes, and **Q** quits.
+
+If the preview cannot be created, fallback controls may be provided by the GNOME helper or an interactive terminal (type `s`, `c`, `p` or `q` and press Enter).
 
 ### Image editor
 
@@ -114,20 +118,39 @@ Open a screenshot in the built-in doodle and crop editor:
 
 - Draw over the image with the mouse.
 - Change brush size and doodle colour.
-- Switch between doodle and crop modes.
-- Apply a selected crop rectangle.
-- Save edits to the original image or quit without saving.
+- Switch between doodle and crop modes with **C**.
+- Apply a selected crop rectangle with **Enter**.
+- **Ctrl+S** saves to the original file *without* exiting, so you can keep editing.
+- **Ctrl+C** copies the current image to the clipboard *without* exiting.
+- **Q** quits. Anything already written with Ctrl+S stays on disk; anything only in the canvas since the last Ctrl+S is discarded.
 - Open the most recently saved screenshot by running `--edit` without a path.
 
 ### Video recording
 
-- Record a selected screen region or the full screen.
-- Set the output frame rate.
-- Scale the recorded video to a requested resolution.
+- Record a selected screen region, the full screen, or (from the preview's **Record** button) the exact region a scrolling capture just used.
+- Set the output frame rate and resolution, or leave both to `config.toml`'s `[recording]` defaults.
+- Optionally capture system audio (`[recording] audio = true` in `config.toml`) and mux it into the video.
 - Encode MP4 video through the external `ffmpeg` executable.
-- Stop recording with Enter or Ctrl+C.
+- Stop recording with Enter or Ctrl+C. Once `ffmpeg` finishes encoding, a desktop notification is sent (when `notify-send` is available) and you're asked whether to save or discard the result — the recording is written to a scratch file first, so discarding never touches the real output path.
 
 Video recording is optional and requires `ffmpeg`; it is not linked into the application.
+
+### Configuration file
+
+Settings that rarely change can live in `~/.config/Wayutils-Screen/config.toml` (or `$XDG_CONFIG_HOME/Wayutils-Screen/config.toml`), created with a commented-out template the first time the app runs. Command-line flags always override it.
+
+```toml
+[paths]
+image_dir = "~/Pictures/Wayutils-Screen"   # default save location for screenshots
+video_dir = "~/Videos/Wayutils-Screen"     # default save location for recordings
+
+[recording]
+mode = "region"          # "region" or "fullscreen" - fullscreen wins even over a
+                          # manually selected region, e.g. from the preview's Record button
+resolution = "1920x1080" # default --resolution when --record omits it
+fps = 12                 # default --fps when --record omits it
+audio = false             # capture system audio (PulseAudio/PipeWire) into recordings
+```
 
 ---
 
@@ -399,12 +422,17 @@ Options:
 
       --fullscreen
       With --record, capture the whole screen instead of selecting a region.
+      config.toml's [recording] mode = "fullscreen" has the same effect by
+      default, and wins even over a manually selected region.
 
       --resolution <WxH>
       With --record, scale the output video to this resolution (e.g. 1280x720).
+      Falls back to config.toml's [recording] resolution, then to the
+      captured region's own size.
 
       --fps <FPS>
-      With --record, set the recording frame rate [default: 12].
+      With --record, set the recording frame rate. Falls back to
+      config.toml's [recording] fps, then to 12.
 
   -h, --help
       Print help.
@@ -467,6 +495,32 @@ cargo test --locked
 cargo build --release --locked
 ```
 
+### Install for the current user
+
+`./install.sh` builds the release binary (unless given `--no-build`) and installs it for the current user - no `sudo` required:
+
+```bash
+./install.sh
+```
+
+This installs:
+
+| What | Where |
+|---|---|
+| Executable | `~/.local/bin/Wayutils-Screen` |
+| Desktop launcher | `~/.local/share/applications/Wayutils-Screen.desktop` |
+| Application icon | `~/.local/share/icons/hicolor/scalable/apps/wayutils-screen.svg` |
+| Default config (only if missing) | `~/.config/Wayutils-Screen/config.toml` |
+
+If `~/.local/bin` isn't already on your `PATH`, the script prints the line to add to your shell profile. Launch from your application menu afterwards, or run `Wayutils-Screen` directly.
+
+To remove everything `install.sh` put in place:
+
+```bash
+./uninstall.sh                 # keeps config.toml and any saved screenshots/recordings
+./uninstall.sh --purge-config  # also deletes ~/.config/Wayutils-Screen
+```
+
 The release GitHub Actions workflow builds in an up-to-date Arch Linux environment and publishes:
 
 `Wayutils-Screen-archlinux-x86_64.zip`
@@ -478,7 +532,7 @@ The archive uses the platform suffix in its filename; the executable inside rema
 ```text
 assets/
   wayutils-screen.svg       Application launcher icon
-  icons/                    Toolbar SVG artwork and embedded PNGs
+  icons/                    Toolbar SVG artwork and embedded PNGs (incl. edit/record)
 
 packaging/
   gnome-extension/          GNOME Shell scrolling-capture helper
@@ -492,8 +546,12 @@ src/
   overlay/                  Preview overlay and controls
   stitch/                   Frame-alignment implementations
   cli.rs                    Command-line arguments
+  config.rs                 ~/.config/Wayutils-Screen/config.toml loader
   editor.rs                 Doodle and crop editor
   record.rs                 Video recording through ffmpeg
+
+install.sh                  User-local install (./install.sh)
+uninstall.sh                Removes what install.sh installed
 ```
 
 Toolbar PNG assets are embedded into the executable at compile time. The original SVG artwork remains in `assets/icons/`. The application icon is installed through the standard `hicolor` icon theme.

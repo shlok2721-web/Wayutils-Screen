@@ -79,6 +79,12 @@ pub struct StitchState {
 pub enum UserCommand {
     Save,
     Copy,
+    /// Finish the current capture and open the result directly in the
+    /// doodle/crop editor instead of just saving it.
+    Edit,
+    /// Finish the current capture and immediately start recording the same
+    /// region as a video.
+    Record,
     Cancel,
     TogglePause,
 }

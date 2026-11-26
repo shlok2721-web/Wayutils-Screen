@@ -8,6 +8,7 @@ use image::RgbaImage;
 
 use crate::capture::{read_region_from_stdin, region_from_slurp_output, select_region, Capturer};
 use crate::cli::{Algorithm, Args};
+use crate::config::Config;
 use crate::idle_finish::IdleAutoFinish;
 use crate::output::{copy_to_clipboard, save_image};
 use crate::overlay::LayerShellOverlay;
@@ -25,7 +26,7 @@ const DUPLICATE_AVG_DIFF: f32 = 1.1;
 const DUPLICATE_MAX_DIFF: u8 = 4;
 
 /// Runs one interactive capture session from region selection to final action.
-pub fn run(args: Args) -> Result<()> {
+pub fn run(args: Args, config: Config) -> Result<()> {
     if !is_wayland_session() {
         bail!("Wayland session required (X11 not supported)");
     }
@@ -71,6 +72,10 @@ pub fn run(args: Args) -> Result<()> {
         UserCommand::Save
     };
     let algorithm = args.algorithm;
+    // Kept alongside the worker's own copy so `run_session` can reuse the
+    // exact same region if the user presses the control bar's "Record"
+    // button (recording the current selection without re-prompting slurp).
+    let region_for_post_action = region.clone();
     let worker = spawn_capture_worker(
         capturer,
         region,
@@ -91,13 +96,23 @@ pub fn run(args: Args) -> Result<()> {
         &mut layer_overlay,
         command_rx,
         &args,
+        &config,
         fail_on_action_error,
     );
 
+    // The border overlay is stopped here, before Edit/Record's own Wayland
+    // surface (if requested) is created below - otherwise the old selection
+    // border and the editor/recording border would briefly both be on
+    // screen at once.
     if let Some(ref mut overlay) = region_overlay {
         overlay.stop();
     }
-    result
+
+    match result? {
+        PostAction::None => Ok(()),
+        PostAction::Edit(path) => crate::editor::run(&path),
+        PostAction::Record => crate::record::run_region(&args, &config, region_for_post_action),
+    }
 }
 
 fn resolve_region(args: &Args) -> Result<Region> {
@@ -110,11 +125,25 @@ fn resolve_region(args: &Args) -> Result<Region> {
     }
 }
 
+/// What to do once the capture loop below has stopped and the worker
+/// thread/overlay have been torn down. Returned from `run_session` (rather
+/// than acted on directly) so the caller can tear down the outer region
+/// border overlay first, before Edit/Record opens its own Wayland surface.
+enum PostAction {
+    None,
+    /// Open the saved snapshot directly in the doodle/crop editor.
+    Edit(std::path::PathBuf),
+    /// Start recording the same region the screenshot session just used.
+    Record,
+}
+
 /// 处理浮层或自动完成指令，直到会话结束并回收捕获线程
 ///
 /// `control` 为运行控制标志，`state` 为拼接状态，`worker` 为捕获线程句柄，
 /// `layer_overlay` 为预览浮层，`command_rx` 为指令接收端，`args` 为命令行参数，
-/// `fail_on_action_error` 表示保存或复制失败时是否直接返回错误退出；返回会话执行结果
+/// `config` 为用户配置，`fail_on_action_error` 表示保存或复制失败时是否直接返回错误退出；
+/// 返回会话结束后应执行的后续动作（直接保存/复制/取消时为 `PostAction::None`）
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     control: Arc<Control>,
     state: Arc<Mutex<StitchState>>,
@@ -122,10 +151,12 @@ fn run_session(
     layer_overlay: &mut Option<LayerShellOverlay>,
     command_rx: mpsc::Receiver<UserCommand>,
     args: &Args,
+    config: &Config,
     fail_on_action_error: bool,
-) -> Result<()> {
+) -> Result<PostAction> {
     let mut paused = false;
     let mut session_error: Option<anyhow::Error> = None;
+    let mut post_action = PostAction::None;
 
     // 1. 持续消费用户或空闲自动完成发出的控制指令
     while let Ok(command) = command_rx.recv() {
@@ -138,7 +169,9 @@ fn run_session(
                 }
             }
             UserCommand::Save => {
-                match take_snapshot(&state).and_then(|img| save_image(img, args.output.clone())) {
+                match take_snapshot(&state)
+                    .and_then(|img| save_image(img, args.output.clone(), config.image_dir.as_deref()))
+                {
                     Ok(path) => {
                         log::info!("【长截图会话】【保存完成】已保存到 {}", path.display());
                         control.stop();
@@ -169,6 +202,32 @@ fn run_session(
                     }
                 }
             },
+            UserCommand::Edit => {
+                match take_snapshot(&state)
+                    .and_then(|img| save_image(img, args.output.clone(), config.image_dir.as_deref()))
+                {
+                    Ok(path) => {
+                        log::info!("【长截图会话】【转到编辑】已保存到 {}，准备打开编辑器", path.display());
+                        post_action = PostAction::Edit(path);
+                        control.stop();
+                        break;
+                    }
+                    Err(err) => {
+                        log::error!("【长截图会话】【转到编辑失败】保存截图失败: {err}");
+                        if fail_on_action_error {
+                            session_error = Some(err);
+                            control.stop();
+                            break;
+                        }
+                    }
+                }
+            }
+            UserCommand::Record => {
+                log::info!("【长截图会话】【转到录制】停止截图捕获，准备录制同一选区");
+                post_action = PostAction::Record;
+                control.stop();
+                break;
+            }
             UserCommand::Cancel => {
                 control.stop();
                 break;
@@ -176,7 +235,7 @@ fn run_session(
         }
     }
 
-    // 2. 停止工作线程与预览浮层并返回结果
+    // 2. 停止工作线程与预览浮层，再把后续动作交还给调用方
     control.stop();
     if let Some(ref mut overlay) = layer_overlay {
         overlay.stop();
@@ -185,7 +244,8 @@ fn run_session(
     if let Some(err) = session_error {
         return Err(err);
     }
-    Ok(())
+
+    Ok(post_action)
 }
 
 /// 判断保存或复制失败时会话是否应直接以错误退出

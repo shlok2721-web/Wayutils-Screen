@@ -31,7 +31,7 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::constants::CONTROL_BAR_HEIGHT;
+use crate::constants::{CONTROL_BAR_HEIGHT, CONTROL_BUTTON_COUNT};
 use crate::types::{LayerMessage, PreviewImage, Region, UserCommand};
 
 mod drawing;
@@ -47,7 +47,6 @@ use placement::{
 // screen without re-implementing Wayland output probing.
 pub(crate) use placement::probe_output_rects;
 
-const CONTROL_BUTTON_COUNT: u32 = 4;
 const INITIAL_HEIGHT: u32 = CONTROL_BAR_HEIGHT;
 const PREVIEW_GAP: i32 = 8;
 
@@ -124,6 +123,9 @@ struct LayerPreview {
     paused: bool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     keyboard_focus: bool,
+    /// Tracks whether Ctrl is currently held, so Ctrl+C/Ctrl+S can be told
+    /// apart from the plain letter keys.
+    ctrl_held: bool,
     pointer: Option<wl_pointer::WlPointer>,
     hover_button: Option<u32>,
 }
@@ -294,10 +296,13 @@ impl LayerPreview {
         } else {
             (x / segment).min(CONTROL_BUTTON_COUNT - 1)
         };
+        // Button order: Save, Copy, Edit, Record, Pause/Resume, Quit.
         let command = match index {
             0 => UserCommand::Save,
             1 => UserCommand::Copy,
-            2 => UserCommand::TogglePause,
+            2 => UserCommand::Edit,
+            3 => UserCommand::Record,
+            4 => UserCommand::TogglePause,
             _ => UserCommand::Cancel,
         };
         self.handle_command(qh, command);
@@ -555,14 +560,29 @@ impl KeyboardHandler for LayerPreview {
             return;
         }
 
-        if let Some(text) = event.utf8.as_deref() {
-            match text {
-                "s" | "S" => self.handle_command(qh, UserCommand::Save),
-                "c" | "C" => self.handle_command(qh, UserCommand::Copy),
-                "q" | "Q" => self.handle_command(qh, UserCommand::Cancel),
-                " " => self.handle_command(qh, UserCommand::TogglePause),
-                _ => {}
-            }
+        // Keysyms for letter keys are unaffected by the Ctrl modifier in xkb
+        // (only Shift changes which letter keysym is reported), so matching
+        // on the keysym plus `self.ctrl_held` reliably tells Ctrl+C/Ctrl+S
+        // apart from the plain letters, regardless of what `event.utf8`
+        // happens to contain for a control chord.
+        let is_c = matches!(event.keysym, Keysym::c | Keysym::C);
+        let is_s = matches!(event.keysym, Keysym::s | Keysym::S);
+        let is_q = matches!(event.keysym, Keysym::q | Keysym::Q);
+        let is_e = matches!(event.keysym, Keysym::e | Keysym::E);
+        let is_r = matches!(event.keysym, Keysym::r | Keysym::R);
+
+        if self.ctrl_held && is_s {
+            self.handle_command(qh, UserCommand::Save);
+        } else if self.ctrl_held && is_c {
+            self.handle_command(qh, UserCommand::Copy);
+        } else if is_q {
+            self.handle_command(qh, UserCommand::Cancel);
+        } else if is_e {
+            self.handle_command(qh, UserCommand::Edit);
+        } else if is_r {
+            self.handle_command(qh, UserCommand::Record);
+        } else if event.keysym == Keysym::space {
+            self.handle_command(qh, UserCommand::TogglePause);
         }
     }
 
@@ -582,9 +602,10 @@ impl KeyboardHandler for LayerPreview {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: u32,
     ) {
+        self.ctrl_held = modifiers.ctrl;
     }
 }
 
@@ -730,6 +751,7 @@ fn run_layer_shell_overlay(
         paused: false,
         keyboard: None,
         keyboard_focus: false,
+        ctrl_held: false,
         pointer: None,
         hover_button: None,
     };

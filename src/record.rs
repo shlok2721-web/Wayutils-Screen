@@ -5,10 +5,16 @@
 //! hand raw frames to the external `ffmpeg` binary over a pipe for encoding.
 //! No video-encoding crate is linked into the binary; `ffmpeg` is only
 //! required (and only invoked) when the user actually asks to record.
+//!
+//! The recording is always written to a temporary file first. Once `ffmpeg`
+//! finishes encoding, a desktop notification is sent (when `notify-send` is
+//! available) and the control bar's Save/Discard prompt is shown so a
+//! recording can be thrown away without ever having touched the real output
+//! path.
 
 use std::borrow::Cow;
-use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,6 +28,7 @@ use image::RgbaImage;
 
 use crate::capture::{read_region_from_stdin, region_from_slurp_output, select_region, Capturer};
 use crate::cli::Args;
+use crate::config::{Config, RecordMode};
 use crate::region_overlay::RegionOverlay;
 use crate::types::Region;
 
@@ -32,8 +39,28 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::SeqCst);
 }
 
-/// Entry point for `--record`.
-pub fn run(args: &Args) -> Result<()> {
+/// Entry point for `--record`: resolves the region itself (slurp/positional/
+/// `--fullscreen`, with `config.toml`'s `[recording] mode` as the default).
+pub fn run(args: &Args, config: &Config) -> Result<()> {
+    let region = resolve_record_region(args, config)?;
+    run_with_region(args, config, region)
+}
+
+/// Entry point used when a region is already known - e.g. the screenshot
+/// preview's "Record" button, which records the exact region the user just
+/// selected for scrolling capture without prompting `slurp` a second time.
+/// `config.toml`'s `[recording] mode = "fullscreen"` still overrides this,
+/// same as it would for a fresh `--record` invocation.
+pub fn run_region(args: &Args, config: &Config, region: Region) -> Result<()> {
+    let region = if matches!(config.record_mode, RecordMode::Fullscreen) {
+        fullscreen_region().unwrap_or(region)
+    } else {
+        region
+    };
+    run_with_region(args, config, region)
+}
+
+fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     if which("ffmpeg").is_none() {
         bail!(
             "ffmpeg was not found in PATH; video recording needs the `ffmpeg` binary installed \
@@ -41,7 +68,6 @@ pub fn run(args: &Args) -> Result<()> {
         );
     }
 
-    let region = resolve_record_region(args)?;
     log::info!(
         "Recording region: {},{} {}x{}",
         region.x,
@@ -51,12 +77,15 @@ pub fn run(args: &Args) -> Result<()> {
     );
 
     let capturer = Capturer::new(args.backend)?;
-    let output_path = resolve_video_path(args.output.clone())?;
-    if let Some(parent) = output_path.parent() {
+    let final_path = resolve_video_path(args.output.clone(), config.video_dir.as_deref())?;
+    if let Some(parent) = final_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // Record to a scratch file first: if the user discards the recording
+    // afterwards, the real output path is never touched.
+    let temp_path = temp_recording_path(&final_path);
 
     // Visual indicator of the recorded area; best-effort only.
     let mut border = if args.no_border {
@@ -77,12 +106,22 @@ pub fn run(args: &Args) -> Result<()> {
     if capture_w == 0 || capture_h == 0 {
         bail!("captured frame is too small to record (region was {region:?})");
     }
-    let (mut out_w, mut out_h) = args.resolution.unwrap_or((capture_w, capture_h));
+    let configured_resolution = args.resolution.or(config.record_resolution);
+    let (mut out_w, mut out_h) = configured_resolution.unwrap_or((capture_w, capture_h));
     out_w = round_down_even(out_w).max(2);
     out_h = round_down_even(out_h).max(2);
-    let fps = args.fps.max(1);
+    let fps = args.fps.or(config.record_fps).unwrap_or(12).max(1);
+    let capture_audio = config.record_audio;
 
-    let mut child = spawn_ffmpeg(&output_path, capture_w, capture_h, out_w, out_h, fps)?;
+    let mut child = spawn_ffmpeg(
+        &temp_path,
+        capture_w,
+        capture_h,
+        out_w,
+        out_h,
+        fps,
+        capture_audio,
+    )?;
     let mut stdin = child
         .stdin
         .take()
@@ -92,11 +131,11 @@ pub fn run(args: &Args) -> Result<()> {
     let stop_from_stdin = spawn_stdin_stop_watcher();
 
     eprintln!(
-        "Recording {}x{} @ {}fps to {} - press Enter or Ctrl+C to stop",
+        "Recording {}x{} @ {}fps{} - press Enter or Ctrl+C to stop",
         capture_w,
         capture_h,
         fps,
-        output_path.display()
+        if capture_audio { " (+ system audio)" } else { "" }
     );
 
     let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
@@ -148,18 +187,107 @@ pub fn run(args: &Args) -> Result<()> {
     }
 
     if encode_failed || !status.success() {
-        bail!(
-            "ffmpeg exited with an error while encoding {}",
-            output_path.display()
-        );
+        let _ = std::fs::remove_file(&temp_path);
+        notify("Wayutils-Screen", "Recording failed while encoding");
+        bail!("ffmpeg exited with an error while encoding the recording");
     }
 
     let secs = started_at.elapsed().as_secs_f64();
-    eprintln!(
-        "Saved ~{secs:.1}s ({frame_count} frames) to {}",
-        output_path.display()
+    notify(
+        "Wayutils-Screen",
+        &format!("Finished encoding ({secs:.1}s, {frame_count} frames)"),
     );
+
+    match prompt_save_or_discard(&temp_path, &final_path) {
+        SaveDecision::Save => {
+            move_file(&temp_path, &final_path)?;
+            eprintln!(
+                "Saved ~{secs:.1}s ({frame_count} frames) to {}",
+                final_path.display()
+            );
+            notify(
+                "Wayutils-Screen",
+                &format!("Recording saved to {}", final_path.display()),
+            );
+        }
+        SaveDecision::Discard => {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("Recording discarded.");
+            notify("Wayutils-Screen", "Recording discarded");
+        }
+    }
+
     Ok(())
+}
+
+enum SaveDecision {
+    Save,
+    Discard,
+}
+
+/// Shows the save/discard choice after encoding finishes. Mirrors the `s`
+/// save / `q` quit convention used by the screenshot session's own
+/// control-bar/terminal fallback. In a non-interactive context (no TTY,
+/// piped stdin, or a closed/errored stream) the recording is kept rather
+/// than silently thrown away.
+fn prompt_save_or_discard(temp_path: &Path, final_path: &Path) -> SaveDecision {
+    if !io::stdin().is_terminal() {
+        log::info!(
+            "non-interactive session: keeping the recording at {}",
+            final_path.display()
+        );
+        return SaveDecision::Save;
+    }
+
+    eprintln!(
+        "Recording stopped ({}). Save it to {}? [s = save / q or d = discard, then Enter] ",
+        temp_path.display(),
+        final_path.display()
+    );
+
+    let mut line = String::new();
+    match io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => SaveDecision::Save, // stdin closed/unreadable: don't lose the recording
+        Ok(_) => match line.trim() {
+            "q" | "Q" | "d" | "D" => SaveDecision::Discard,
+            _ => SaveDecision::Save,
+        },
+    }
+}
+
+/// Moves the temp recording into place, falling back to copy+remove when the
+/// temp file and destination are on different filesystems (`rename(2)` can't
+/// cross mount points).
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)
+        .with_context(|| format!("failed to move recording to {}", to.display()))?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+/// Best-effort desktop notification; silently does nothing if `notify-send`
+/// isn't installed (not every Wayland desktop ships it).
+fn notify(summary: &str, body: &str) {
+    if which("notify-send").is_none() {
+        return;
+    }
+    if let Err(err) = Command::new("notify-send").arg(summary).arg(body).status() {
+        log::debug!("notify-send failed: {err}");
+    }
+}
+
+fn temp_recording_path(final_path: &Path) -> PathBuf {
+    let ext = final_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
+    std::env::temp_dir().join(format!(
+        "wayutils-screen-recording-{}.{ext}",
+        std::process::id()
+    ))
 }
 
 /// Rounds a dimension down to the nearest even number (libx264 + yuv420p
@@ -184,12 +312,13 @@ fn normalize_frame(frame: &RgbaImage, w: u32, h: u32) -> Cow<'_, RgbaImage> {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_ffmpeg(
-    output_path: &PathBuf,
+    output_path: &Path,
     capture_w: u32,
     capture_h: u32,
     out_w: u32,
     out_h: u32,
     fps: u32,
+    capture_audio: bool,
 ) -> Result<Child> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args([
@@ -204,22 +333,32 @@ fn spawn_ffmpeg(
         &format!("{capture_w}x{capture_h}"),
         "-framerate",
         &fps.to_string(),
+        "-use_wallclock_as_timestamps",
+        "1",
         "-i",
         "-",
     ]);
+    if capture_audio {
+        // PulseAudio's "default" source also works against PipeWire desktops
+        // through pipewire-pulse, so this covers both common setups without
+        // branching on which sound server is running.
+        cmd.args([
+            "-f",
+            "pulse",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            "default",
+        ]);
+    }
     if out_w != capture_w || out_h != capture_h {
         cmd.args(["-vf", &format!("scale={out_w}:{out_h}")]);
     }
-    cmd.args([
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-    ]);
+    cmd.args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+    if capture_audio {
+        cmd.args(["-c:a", "aac", "-b:a", "128k", "-shortest"]);
+    }
+    cmd.args(["-movflags", "+faststart"]);
     cmd.arg(output_path);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::null());
@@ -228,24 +367,13 @@ fn spawn_ffmpeg(
 }
 
 /// Resolves the region to record: the whole (primary) screen with
-/// `--fullscreen`, otherwise the usual slurp-geometry/positional/interactive
-/// selection shared with the screenshot flow.
-fn resolve_record_region(args: &Args) -> Result<Region> {
-    if args.fullscreen {
-        let outputs = crate::overlay::probe_output_rects().unwrap_or_default();
-        let output = outputs
-            .first()
-            .ok_or_else(|| anyhow!("no outputs detected for --fullscreen"))?;
-        return Ok(Region {
-            raw: format!(
-                "{},{} {}x{}",
-                output.x, output.y, output.width, output.height
-            ),
-            x: output.x,
-            y: output.y,
-            w: output.width.max(0) as u32,
-            h: output.height.max(0) as u32,
-        });
+/// `--fullscreen` or `config.toml`'s `[recording] mode = "fullscreen"`,
+/// otherwise the usual slurp-geometry/positional/interactive selection
+/// shared with the screenshot flow.
+fn resolve_record_region(args: &Args, config: &Config) -> Result<Region> {
+    if args.fullscreen || matches!(config.record_mode, RecordMode::Fullscreen) {
+        return fullscreen_region()
+            .ok_or_else(|| anyhow!("no outputs detected for fullscreen recording"));
     }
 
     match args.slurp_output() {
@@ -257,9 +385,27 @@ fn resolve_record_region(args: &Args) -> Result<Region> {
     }
 }
 
+fn fullscreen_region() -> Option<Region> {
+    let outputs = crate::overlay::probe_output_rects().unwrap_or_default();
+    let output = outputs.first()?;
+    Some(Region {
+        raw: format!(
+            "{},{} {}x{}",
+            output.x, output.y, output.width, output.height
+        ),
+        x: output.x,
+        y: output.y,
+        w: output.width.max(0) as u32,
+        h: output.height.max(0) as u32,
+    })
+}
+
 /// Resolves the final `.mp4` output path, mirroring `output::save_image`'s
 /// handling of directories/missing extensions but for video.
-fn resolve_video_path(output_path: Option<PathBuf>) -> Result<PathBuf> {
+///
+/// `configured_dir` is the `[paths] video_dir` from `config.toml`, used only
+/// when `output_path` is `None`.
+fn resolve_video_path(output_path: Option<PathBuf>, configured_dir: Option<&Path>) -> Result<PathBuf> {
     let path = match output_path {
         Some(p) => {
             if p.is_dir() {
@@ -270,7 +416,12 @@ fn resolve_video_path(output_path: Option<PathBuf>) -> Result<PathBuf> {
                 p
             }
         }
-        None => default_video_output_dir().join(timestamped_video_filename()),
+        None => {
+            let dir = configured_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(default_video_output_dir);
+            dir.join(timestamped_video_filename())
+        }
     };
     Ok(path)
 }
@@ -317,4 +468,24 @@ fn spawn_stdin_stop_watcher() -> Arc<AtomicBool> {
         });
     }
     flag
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_video_path_prefers_configured_dir_over_builtin_default() {
+        let configured = PathBuf::from("/tmp/wss-test-video-dir");
+        let path = resolve_video_path(None, Some(&configured)).unwrap();
+        assert_eq!(path.parent(), Some(configured.as_path()));
+    }
+
+    #[test]
+    fn resolve_video_path_explicit_output_wins_over_config() {
+        let configured = PathBuf::from("/tmp/wss-test-video-dir");
+        let explicit = PathBuf::from("/tmp/explicit-output.mp4");
+        let path = resolve_video_path(Some(explicit.clone()), Some(&configured)).unwrap();
+        assert_eq!(path, explicit);
+    }
 }

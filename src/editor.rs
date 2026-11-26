@@ -8,10 +8,13 @@
 //! - `c`: toggle crop mode.
 //! - Enter: apply the pending crop rectangle.
 //! - Escape: cancel a pending crop (or quit, if nothing is pending).
-//! - `s`: save (overwrites the original file) and exit.
-//! - `q`: quit without saving.
+//! - `Ctrl+S`: save (overwrites the original file) and keep editing.
+//! - `Ctrl+C`: copy the current image to the clipboard and keep editing.
+//! - `q`: quit. Anything already written via Ctrl+S stays on disk; anything
+//!   only in the in-memory canvas since the last Ctrl+S is discarded.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -126,7 +129,7 @@ pub fn run(path: &Path) -> Result<()> {
         max_output,
         configured: false,
         exit: false,
-        save_requested: false,
+        path: path.to_path_buf(),
         canvas,
         scale,
         display_buffer,
@@ -136,6 +139,7 @@ pub fn run(path: &Path) -> Result<()> {
         keyboard: None,
         pointer: None,
         keyboard_focus: false,
+        ctrl_held: false,
         pointer_down: false,
         last_canvas_point: None,
         cursor_display_pos: None,
@@ -149,7 +153,8 @@ pub fn run(path: &Path) -> Result<()> {
 
     eprintln!(
         "Edit mode: drag to doodle | Up/Down brush size | Left/Right color | c crop | \
-         Enter confirm crop | Esc cancel crop/quit | s save & quit | q quit"
+         Enter confirm crop | Esc cancel crop/quit | Ctrl+S save (keep editing) | \
+         Ctrl+C copy to clipboard (keep editing) | q quit"
     );
 
     loop {
@@ -166,16 +171,7 @@ pub fn run(path: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(8));
     }
 
-    if state.save_requested {
-        let format = crate::output::format_for_path(path);
-        state
-            .canvas
-            .save_with_format(path, format)
-            .with_context(|| format!("failed to save {}", path.display()))?;
-        eprintln!("Saved edits to {}", path.display());
-    } else {
-        eprintln!("Discarded edits (not saved).");
-    }
+    eprintln!("Exited the editor. (Ctrl+S saves immediately while editing; quitting does not save.)");
 
     Ok(())
 }
@@ -239,7 +235,9 @@ struct EditorState {
     max_output: (u32, u32),
     configured: bool,
     exit: bool,
-    save_requested: bool,
+
+    /// The file this editor was opened on; `Ctrl+S` overwrites this path.
+    path: PathBuf,
 
     /// The actual edited image, at full (post-crop) resolution. Doodles are
     /// painted directly into this buffer.
@@ -263,6 +261,9 @@ struct EditorState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard_focus: bool,
+    /// Tracks whether Ctrl is currently held, so Ctrl+S/Ctrl+C can be told
+    /// apart from the plain `s`/`c` letter keys.
+    ctrl_held: bool,
 
     pointer_down: bool,
     last_canvas_point: Option<(f32, f32)>,
@@ -386,6 +387,25 @@ impl EditorState {
         self.canvas = cropped;
         self.mode = Mode::Doodle;
         self.recompute_layout(qh);
+    }
+
+    /// `Ctrl+S`: overwrites the original file with the current canvas,
+    /// without exiting the editor so doodling/cropping can continue.
+    fn quick_save(&mut self) {
+        let format = crate::output::format_for_path(&self.path);
+        match self.canvas.save_with_format(&self.path, format) {
+            Ok(()) => eprintln!("Saved to {}", self.path.display()),
+            Err(err) => eprintln!("Failed to save {}: {err}", self.path.display()),
+        }
+    }
+
+    /// `Ctrl+C`: copies the current canvas to the clipboard, without exiting
+    /// the editor so doodling/cropping can continue.
+    fn quick_copy(&mut self) {
+        match crate::output::copy_to_clipboard(Arc::new(self.canvas.clone())) {
+            Ok(()) => eprintln!("Copied to clipboard"),
+            Err(err) => eprintln!("Failed to copy to clipboard: {err}"),
+        }
     }
 
     fn recompute_layout(&mut self, qh: &QueueHandle<Self>) {
@@ -700,10 +720,33 @@ impl LayerShellHandler for EditorState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if configure.new_size.0 != 0 && configure.new_size.1 != 0 {
-            self.display_w = configure.new_size.0;
-            self.display_h = configure.new_size.1;
+        let assigned_size = if configure.new_size.0 != 0 && configure.new_size.1 != 0 {
+            (configure.new_size.0, configure.new_size.1)
+        } else {
+            (self.display_w, self.display_h)
+        };
+
+        // Some compositors configure an unanchored overlay surface to a size
+        // other than the one we requested (or, on the very first configure,
+        // may not yet match the size `run()` computed before any roundtrip).
+        // `display_buffer` is a cache pre-scaled to a *specific* display
+        // size, so if we only updated `display_w`/`display_h` here without
+        // rebuilding it, `draw()` would find a length mismatch, log a
+        // warning and blank the surface - which is exactly why the
+        // screenshot wouldn't show up. Re-fit and rebuild the cache for
+        // whatever size the compositor actually assigned.
+        if assigned_size != (self.display_w, self.display_h) || !self.configured {
+            let (display_w, display_h, scale) =
+                fit_to_output(self.canvas.width(), self.canvas.height(), assigned_size);
+            self.display_w = display_w;
+            self.display_h = display_h;
+            self.scale = scale;
+            self.display_buffer = build_display_buffer(&self.canvas, display_w, display_h, scale);
+            // Tell the compositor our actual (aspect-correct) size back, in
+            // case it differs from what it just assigned us.
+            self.layer.set_size(display_w, display_h);
         }
+
         self.configured = true;
         self.draw(qh);
     }
@@ -829,26 +872,29 @@ impl KeyboardHandler for EditorState {
             return;
         }
 
-        if let Some(text) = event.utf8.as_deref() {
-            match text {
-                "c" | "C" => {
-                    self.mode = match self.mode {
-                        Mode::Doodle => Mode::Crop,
-                        Mode::Crop => Mode::Doodle,
-                    };
-                    self.crop_start = None;
-                    self.crop_current = None;
-                    self.request_redraw(qh);
-                }
-                "s" | "S" => {
-                    self.save_requested = true;
-                    self.exit = true;
-                }
-                "q" | "Q" => {
-                    self.exit = true;
-                }
-                _ => {}
-            }
+        // Keysyms for letter keys are unaffected by the Ctrl modifier in xkb
+        // (only Shift changes which letter keysym is reported), so matching
+        // on the keysym plus `self.ctrl_held` reliably tells Ctrl+C/Ctrl+S
+        // apart from the plain `c`/`s` keys, regardless of what
+        // `event.utf8` happens to contain for a control chord.
+        let is_c = matches!(keysym, Keysym::c | Keysym::C);
+        let is_s = matches!(keysym, Keysym::s | Keysym::S);
+        let is_q = matches!(keysym, Keysym::q | Keysym::Q);
+
+        if self.ctrl_held && is_s {
+            self.quick_save();
+        } else if self.ctrl_held && is_c {
+            self.quick_copy();
+        } else if is_c {
+            self.mode = match self.mode {
+                Mode::Doodle => Mode::Crop,
+                Mode::Crop => Mode::Doodle,
+            };
+            self.crop_start = None;
+            self.crop_current = None;
+            self.request_redraw(qh);
+        } else if is_q {
+            self.exit = true;
         }
     }
 
@@ -868,9 +914,10 @@ impl KeyboardHandler for EditorState {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: u32,
     ) {
+        self.ctrl_held = modifiers.ctrl;
     }
 }
 

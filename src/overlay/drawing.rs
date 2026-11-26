@@ -2,10 +2,9 @@ use std::sync::OnceLock;
 
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
 
-use crate::constants::CONTROL_BAR_HEIGHT;
+use crate::constants::{CONTROL_BAR_HEIGHT, CONTROL_BUTTON_COUNT};
 use crate::types::PreviewImage;
 
-const CONTROL_BUTTON_COUNT: u32 = 4;
 const ICON_SIZE: u32 = 24;
 const COLOR_BUTTON: [u8; 4] = [228, 226, 255, 244];
 const COLOR_BUTTON_HOVER: [u8; 4] = [250, 249, 255, 255];
@@ -19,11 +18,16 @@ struct EmbeddedIcon {
 /// The SVG artwork is converted to PNG at 128px in `assets/icons/` and embedded
 /// at compile time. The decoded 24px bitmaps are cached for the lifetime of the
 /// process so drawing the preview does not repeatedly decode image data.
-fn toolbar_icons() -> &'static [Option<EmbeddedIcon>; 4] {
-    static ICONS: OnceLock<[Option<EmbeddedIcon>; 4]> = OnceLock::new();
+///
+/// Button order matches the hit-testing in `overlay.rs`:
+/// Save, Copy, Edit, Record, Pause/Resume, Quit.
+fn toolbar_icons() -> &'static [Option<EmbeddedIcon>; 6] {
+    static ICONS: OnceLock<[Option<EmbeddedIcon>; 6]> = OnceLock::new();
     ICONS.get_or_init(|| [
         load_embedded_icon(include_bytes!("../../assets/icons/save.png")),
         load_embedded_icon(include_bytes!("../../assets/icons/layers.png")),
+        load_embedded_icon(include_bytes!("../../assets/icons/edit.png")),
+        load_embedded_icon(include_bytes!("../../assets/icons/record.png")),
         load_embedded_icon(include_bytes!("../../assets/icons/orb.png")),
         load_embedded_icon(include_bytes!("../../assets/icons/logout.png")),
     ])
@@ -54,7 +58,7 @@ fn load_embedded_icon(bytes: &[u8]) -> Option<EmbeddedIcon> {
     })
 }
 
-/// Draws the control bar (Save/Copy/Pause/Cancel) at the bottom.
+/// Draws the control bar (Save/Copy/Edit/Record/Pause/Quit) at the bottom.
 pub(super) fn draw_control_bar(
     canvas: &mut [u8],
     width: u32,
