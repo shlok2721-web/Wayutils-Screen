@@ -144,6 +144,14 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let mut frame_count: u64 = 0;
     let started_at = Instant::now();
     let mut encode_failed = false;
+    let mut capture_lost = false;
+
+    // A single failed grab (e.g. a brief hiccup from the compositor mid
+    // workspace-switch animation) shouldn't end the whole recording: we
+    // keep re-showing the last good frame and keep retrying for up to
+    // roughly two seconds' worth of frames before giving up for real.
+    let max_consecutive_capture_failures = (fps * 2).max(10);
+    let mut consecutive_capture_failures: u32 = 0;
 
     loop {
         if should_stop(&stop_from_stdin) {
@@ -172,13 +180,47 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
             break;
         }
 
-        frame = match capturer.capture(&region) {
-            Ok(frame) => frame,
-            Err(err) => {
-                log::warn!("frame capture failed, stopping recording: {err}");
-                break;
+        match capturer.capture(&region) {
+            Ok(next) => {
+                frame = next;
+                consecutive_capture_failures = 0;
             }
-        };
+            Err(err) => {
+                consecutive_capture_failures += 1;
+                log::warn!(
+                    "frame capture failed ({consecutive_capture_failures}/{max_consecutive_capture_failures}): {err}"
+                );
+                if consecutive_capture_failures >= max_consecutive_capture_failures {
+                    // Visible, not just logged: a log::warn! is invisible
+                    // with the default log level, which is exactly how this
+                    // used to fail silently - the recording would stop but
+                    // nothing told you until you pressed Enter/Ctrl+C
+                    // yourself and only then saw it finish immediately.
+                    eprintln!(
+                        "Lost the capture region for {consecutive_capture_failures} frames in a \
+                         row ({err}); stopping the recording."
+                    );
+                    capture_lost = true;
+                    break;
+                }
+                // Otherwise: keep the previous frame on screen and try
+                // again next tick instead of ending the recording.
+            }
+        }
+    }
+
+    // Stop the on-screen selection rectangle the instant we've decided to
+    // stop capturing, rather than after waiting on ffmpeg to finish
+    // encoding below - the whole point is that it shouldn't look like
+    // recording is still happening once it isn't.
+    if let Some(ref mut overlay) = border {
+        overlay.stop();
+    }
+    if capture_lost {
+        notify(
+            "Wayutils-Screen",
+            "Recording stopped: lost the capture region (e.g. output disconnected or a protocol hiccup)",
+        );
     }
 
     // Closing stdin signals EOF to ffmpeg so it can finalize the container
@@ -186,10 +228,6 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     // broken file behind.
     drop(stdin);
     let status = child.wait().context("failed waiting for ffmpeg to exit")?;
-
-    if let Some(ref mut overlay) = border {
-        overlay.stop();
-    }
 
     if encode_failed || !status.success() {
         let _ = std::fs::remove_file(&temp_path);

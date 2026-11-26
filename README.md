@@ -133,6 +133,7 @@ Open a screenshot in the built-in doodle and crop editor:
 - Optionally capture system audio (`[recording] audio = true` in `config.toml`) and mux it into the video.
 - Encode MP4 video through the external `ffmpeg` executable.
 - Stop recording with Enter or Ctrl+C. Once `ffmpeg` finishes encoding, a desktop notification is sent (when `notify-send` is available) and you're asked whether to save or discard the result — the recording is written to a scratch file first, so discarding never touches the real output path.
+- A brief capture hiccup (e.g. a workspace-switch animation) no longer silently ends the recording — it keeps retrying for a couple of seconds before giving up, and if it does have to stop early you get a clear on-screen message and notification instead of the selection rectangle just lingering with no explanation.
 
 Video recording is optional and requires `ffmpeg`; it is not linked into the application.
 
