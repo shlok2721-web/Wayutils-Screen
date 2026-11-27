@@ -6,11 +6,14 @@
 //! No video-encoding crate is linked into the binary; `ffmpeg` is only
 //! required (and only invoked) when the user actually asks to record.
 //!
-//! The recording is always written to a temporary file first. Once `ffmpeg`
-//! finishes encoding, a desktop notification is sent (when `notify-send` is
-//! available) and the control bar's Save/Discard prompt is shown so a
-//! recording can be thrown away without ever having touched the real output
-//! path.
+//! The recording is always written to a temporary file first, so discarding
+//! it never touches the real output path. It can be stopped three ways:
+//! clicking the border's strip then pressing Ctrl+S (save) or Ctrl+Q
+//! (discard) - no terminal needed; pressing Enter or Ctrl+C in the terminal
+//! that launched it, which still asks save-or-discard there; or losing the
+//! capture region for too long (e.g. the output got disconnected), which
+//! stops it automatically. Once `ffmpeg` finishes encoding, a desktop
+//! notification is sent too, when `notify-send` is available.
 
 use std::borrow::Cow;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
@@ -18,7 +21,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +34,7 @@ use crate::capture::{read_region_from_stdin, region_from_slurp_output, select_re
 use crate::cli::Args;
 use crate::config::{Config, RecordMode};
 use crate::region_overlay::RegionOverlay;
-use crate::types::Region;
+use crate::types::{RecordingCommand, Region};
 
 /// Set by the SIGINT handler; polled from the capture loop.
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -88,11 +91,19 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     // afterwards, the real output path is never touched.
     let temp_path = temp_recording_path(&final_path);
 
-    // Visual indicator of the recorded area; best-effort only.
-    let mut border = if args.no_border {
-        None
+    // Visual indicator of the recorded area; best-effort only. When it's
+    // available, its border strip is also clickable: click it, then Ctrl+S
+    // stops and saves, Ctrl+Q stops and discards - no terminal required.
+    let (mut border, recording_rx) = if args.no_border {
+        (None, None)
     } else {
-        RegionOverlay::new(region.clone()).ok()
+        match RegionOverlay::new_for_recording(region.clone()) {
+            Ok((overlay, rx)) => (Some(overlay), Some(rx)),
+            Err(err) => {
+                log::warn!("recording border overlay unavailable: {err}");
+                (None, None)
+            }
+        }
     };
 
     let first_frame = capturer
@@ -132,7 +143,8 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let stop_from_stdin = spawn_stdin_stop_watcher();
 
     eprintln!(
-        "Recording {}x{} @ {}fps{} - press Enter or Ctrl+C to stop",
+        "Recording {}x{} @ {}fps{} - click the border then Ctrl+S to save / Ctrl+Q to discard, \
+         or press Enter/Ctrl+C here to stop and be asked",
         capture_w,
         capture_h,
         fps,
@@ -145,6 +157,11 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let started_at = Instant::now();
     let mut encode_failed = false;
     let mut capture_lost = false;
+    // `Some(decision)` once the border's Ctrl+S/Ctrl+Q has already answered
+    // the save/discard question - set below whenever `poll_stop` sees one of
+    // those come in. Stopping via Enter/Ctrl+C or losing the capture region
+    // leaves this `None`, which means "still ask" (see `prompt_save_or_discard`).
+    let mut explicit_decision: Option<SaveDecision> = None;
 
     // A single failed grab (e.g. a brief hiccup from the compositor mid
     // workspace-switch animation) shouldn't end the whole recording: we
@@ -154,7 +171,8 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let mut consecutive_capture_failures: u32 = 0;
 
     loop {
-        if should_stop(&stop_from_stdin) {
+        if let Some(decision) = poll_stop(&stop_from_stdin, recording_rx.as_ref()) {
+            explicit_decision = decision;
             break;
         }
 
@@ -176,7 +194,8 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
             thread::sleep(frame_interval - elapsed);
         }
 
-        if should_stop(&stop_from_stdin) {
+        if let Some(decision) = poll_stop(&stop_from_stdin, recording_rx.as_ref()) {
+            explicit_decision = decision;
             break;
         }
 
@@ -241,7 +260,9 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
         &format!("Finished encoding ({secs:.1}s, {frame_count} frames)"),
     );
 
-    match prompt_save_or_discard(&temp_path, &final_path) {
+    let decision =
+        explicit_decision.unwrap_or_else(|| prompt_save_or_discard(&temp_path, &final_path));
+    match decision {
         SaveDecision::Save => {
             move_file(&temp_path, &final_path)?;
             eprintln!(
@@ -341,6 +362,28 @@ fn round_down_even(v: u32) -> u32 {
 
 fn should_stop(stop_from_stdin: &Arc<AtomicBool>) -> bool {
     STOP_REQUESTED.load(Ordering::SeqCst) || stop_from_stdin.load(Ordering::SeqCst)
+}
+
+/// Polls every way the recording can be asked to stop. Returns `None` while
+/// recording should continue. Returns `Some(Some(decision))` once the
+/// border's Ctrl+S/Ctrl+Q has already answered the save/discard question -
+/// or `Some(None)` when the stop instead came from Enter, Ctrl+C, so the
+/// save/discard question still needs asking (see `prompt_save_or_discard`).
+fn poll_stop(
+    stop_from_stdin: &Arc<AtomicBool>,
+    recording_rx: Option<&mpsc::Receiver<RecordingCommand>>,
+) -> Option<Option<SaveDecision>> {
+    if let Some(rx) = recording_rx {
+        match rx.try_recv() {
+            Ok(RecordingCommand::Save) => return Some(Some(SaveDecision::Save)),
+            Ok(RecordingCommand::Discard) => return Some(Some(SaveDecision::Discard)),
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+    if should_stop(stop_from_stdin) {
+        return Some(None);
+    }
+    None
 }
 
 /// Ensures every frame fed to ffmpeg matches the locked-in capture size,

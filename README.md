@@ -132,7 +132,7 @@ Open a screenshot in the built-in doodle and crop editor:
 - Set the output frame rate and resolution, or leave both to `config.toml`'s `[recording]` defaults.
 - Optionally capture system audio (`[recording] audio = true` in `config.toml`) and mux it into the video.
 - Encode MP4 video through the external `ffmpeg` executable.
-- Stop recording with Enter or Ctrl+C. Once `ffmpeg` finishes encoding, a desktop notification is sent (when `notify-send` is available) and you're asked whether to save or discard the result — the recording is written to a scratch file first, so discarding never touches the real output path.
+- Stop recording by clicking the border rectangle, then pressing **Ctrl+S** (save) or **Ctrl+Q** (discard) — no terminal needed. Enter or Ctrl+C in the terminal that launched the recording still work too, and still ask save-or-discard there. The recording is written to a scratch file first, so discarding never touches the real output path, and a desktop notification is sent once `ffmpeg` finishes encoding (when `notify-send` is available).
 - A brief capture hiccup (e.g. a workspace-switch animation) no longer silently ends the recording — it keeps retrying for a couple of seconds before giving up, and if it does have to stop early you get a clear on-screen message and notification instead of the selection rectangle just lingering with no explanation.
 
 Video recording is optional and requires `ffmpeg`; it is not linked into the application.
@@ -404,7 +404,9 @@ Options:
       Finish after this duration without scroll updates (e.g. 2s, 1500ms, 2.5).
 
       --no-border
-      Disable the region border overlay.
+      Disable the region border overlay. With --record, this also removes
+      the Ctrl+S/Ctrl+Q border-click controls, leaving Enter/Ctrl+C in the
+      terminal as the only way to stop.
 
   -a, --algorithm <ALGORITHM>
       Stitching algorithm [default: opencv-orb].

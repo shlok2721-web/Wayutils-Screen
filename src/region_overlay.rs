@@ -1,15 +1,20 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputData, OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -21,12 +26,12 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_region, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_region, wl_seat, wl_shm, wl_surface},
     Connection, Proxy, QueueHandle,
 };
 
 use crate::constants::{REGION_BORDER_COLOR, REGION_BORDER_WIDTH};
-use crate::types::Region;
+use crate::types::{Region, RecordingCommand};
 
 #[derive(Clone, Copy, Debug)]
 struct OutputRect {
@@ -158,14 +163,35 @@ pub struct RegionOverlay {
 
 impl RegionOverlay {
     /// Spawns the region border overlay thread and waits for initialization.
+    /// This variant is purely visual (click-through, no keyboard focus) -
+    /// used for the scrolling-screenshot selection border, which already has
+    /// its own preview overlay/terminal handling keyboard input.
     pub fn new(region: Region) -> Result<Self> {
+        Self::spawn(region, None)
+    }
+
+    /// Like [`RegionOverlay::new`], but the border strip itself (not the
+    /// recorded interior, which stays click-through so the recording can
+    /// still be interacted with normally) is clickable: clicking it gives
+    /// the border keyboard focus, after which Ctrl+S sends
+    /// [`RecordingCommand::Save`] and Ctrl+Q sends
+    /// [`RecordingCommand::Discard`] on the returned channel. Used for
+    /// `--record`, so stopping a recording doesn't require switching to a
+    /// terminal.
+    pub fn new_for_recording(region: Region) -> Result<(Self, mpsc::Receiver<RecordingCommand>)> {
+        let (tx, rx) = mpsc::channel();
+        let overlay = Self::spawn(region, Some(tx))?;
+        Ok((overlay, rx))
+    }
+
+    fn spawn(region: Region, command_tx: Option<mpsc::Sender<RecordingCommand>>) -> Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
 
         let handle = thread::spawn(move || {
-            if let Err(err) = run_region_overlay(region, stop_clone, ready_clone) {
+            if let Err(err) = run_region_overlay(region, stop_clone, ready_clone, command_tx) {
                 log::warn!("region overlay failed: {err}");
             }
         });
@@ -198,6 +224,7 @@ impl Drop for RegionOverlay {
 
 struct RegionBorder {
     registry_state: RegistryState,
+    seat_state: SeatState,
     output_state: OutputState,
     shm: Shm,
     pool: Option<SlotPool>,
@@ -206,6 +233,17 @@ struct RegionBorder {
     height: u32,
     configured: bool,
     exit: bool,
+
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// Tracks whether Ctrl is currently held, so Ctrl+S/Ctrl+Q can be told
+    /// apart from the plain `s`/`q` letter keys (which should do nothing
+    /// here - this border is only ever focused deliberately, by clicking
+    /// its own strip, so there's no risk of stealing a stray `s` or `q`
+    /// meant for whatever's being recorded, but Ctrl avoids any doubt).
+    ctrl_held: bool,
+    /// `Some` only for the `--record` border (see `new_for_recording`); the
+    /// plain `new` border never grabs keyboard focus at all.
+    command_tx: Option<mpsc::Sender<RecordingCommand>>,
 }
 
 impl RegionBorder {
@@ -361,10 +399,122 @@ impl ShmHandler for RegionBorder {
     }
 }
 
+impl SeatHandler for RegionBorder {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if self.command_tx.is_some() && capability == Capability::Keyboard && self.keyboard.is_none()
+        {
+            if let Ok(keyboard) = self.seat_state.get_keyboard(qh, &seat, None) {
+                self.keyboard = Some(keyboard);
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard {
+            if let Some(keyboard) = self.keyboard.take() {
+                keyboard.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for RegionBorder {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _qh: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        let Some(tx) = &self.command_tx else {
+            return;
+        };
+        if !self.ctrl_held {
+            return;
+        }
+        // Keysyms for letter keys are unaffected by the Ctrl modifier in xkb
+        // (only Shift changes which letter keysym is reported), so matching
+        // on the keysym plus `self.ctrl_held` reliably tells Ctrl+S/Ctrl+Q
+        // apart from the plain letters.
+        if matches!(event.keysym, Keysym::s | Keysym::S) {
+            let _ = tx.send(RecordingCommand::Save);
+        } else if matches!(event.keysym, Keysym::q | Keysym::Q) {
+            let _ = tx.send(RecordingCommand::Discard);
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: u32,
+    ) {
+        self.ctrl_held = modifiers.ctrl;
+    }
+}
+
 delegate_compositor!(RegionBorder);
 delegate_output!(RegionBorder);
 delegate_shm!(RegionBorder);
 delegate_layer!(RegionBorder);
+delegate_seat!(RegionBorder);
+delegate_keyboard!(RegionBorder);
 delegate_registry!(RegionBorder);
 
 impl ProvidesRegistryState for RegionBorder {
@@ -372,7 +522,7 @@ impl ProvidesRegistryState for RegionBorder {
         &mut self.registry_state
     }
 
-    registry_handlers!(OutputState);
+    registry_handlers!(OutputState, SeatState);
 }
 
 impl wayland_client::Dispatch<wl_region::WlRegion, ()> for RegionBorder {
@@ -391,6 +541,7 @@ fn run_region_overlay(
     region: Region,
     stop_flag: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    command_tx: Option<mpsc::Sender<RecordingCommand>>,
 ) -> Result<()> {
     log::info!("Starting region overlay thread");
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
@@ -400,9 +551,12 @@ fn run_region_overlay(
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
     let layer_shell = LayerShell::bind(&globals, &qh).context("layer-shell not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
+    let seat_state = SeatState::new(&globals, &qh);
 
+    let wants_keyboard = command_tx.is_some();
     let mut border_state = RegionBorder {
         registry_state: RegistryState::new(&globals),
+        seat_state,
         output_state: OutputState::new(&globals, &qh),
         shm,
         pool: None,
@@ -411,6 +565,9 @@ fn run_region_overlay(
         height: 1,
         configured: false,
         exit: false,
+        keyboard: None,
+        ctrl_held: false,
+        command_tx,
     };
 
     event_queue
@@ -442,7 +599,17 @@ fn run_region_overlay(
         .unwrap_or((0, 0));
 
     layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer.set_keyboard_interactivity(if wants_keyboard {
+        // Rather than Exclusive (which would grab the keyboard away from
+        // every other app system-wide for as long as the recording runs -
+        // defeating the point of recording your normal desktop use), this
+        // border only becomes focused when its own strip is clicked (see
+        // the input region below), so Ctrl+S/Ctrl+Q work without blocking
+        // input to whatever is actually being recorded.
+        KeyboardInteractivity::OnDemand
+    } else {
+        KeyboardInteractivity::None
+    });
     layer.set_exclusive_zone(-1);
     layer.set_margin(
         region.y - output_origin.1 - border as i32,
@@ -453,6 +620,18 @@ fn run_region_overlay(
     layer.set_size(width, height);
 
     let input_region = compositor.wl_compositor().create_region(&qh, ());
+    if wants_keyboard {
+        // Only the drawn border strip itself is clickable - the interior
+        // (the actual recorded area) stays click-through, same as the
+        // plain border, so recording still works normally with whatever is
+        // underneath. Clicking the border briefly gives it keyboard focus;
+        // see `KeyboardHandler::press_key` for what Ctrl+S/Ctrl+Q then do.
+        let (w, h, b) = (width as i32, height as i32, border as i32);
+        input_region.add(0, 0, w, b); // top
+        input_region.add(0, h - b, w, b); // bottom
+        input_region.add(0, 0, b, h); // left
+        input_region.add(w - b, 0, b, h); // right
+    }
     layer.wl_surface().set_input_region(Some(&input_region));
     layer.commit();
 
