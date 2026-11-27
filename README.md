@@ -116,9 +116,11 @@ If the preview cannot be created, fallback controls may be provided by the GNOME
 
 Open a screenshot in the built-in doodle and crop editor:
 
-- The rest of the screen dims behind the image while you edit, so it's visually obvious you're in a modal edit session rather than looking at an unchanged desktop.
-- Draw over the image with the mouse.
+- The rest of the screen dims behind the image with a neutral near-black charcoal backdrop (`#171717`).
+- Draw over the image with the mouse; brush strokes are kept undoable.
 - Change brush size and doodle colour.
+- **Ctrl+Z** undoes the last doodle or eraser stroke.
+- **Ctrl+X** toggles the eraser; erased pixels reveal the original screenshot.
 - Switch between doodle and crop modes with **C**.
 - Apply a selected crop rectangle with **Enter**.
 - **Ctrl+S** saves to the original file and exits.
@@ -132,7 +134,7 @@ Open a screenshot in the built-in doodle and crop editor:
 - Set the output frame rate and resolution, or leave both to `config.toml`'s `[recording]` defaults.
 - Optionally capture system audio (`[recording] audio = true` in `config.toml`) and mux it into the video.
 - Encode MP4 video through the external `ffmpeg` executable.
-- Stop recording by clicking the border rectangle, then pressing **Ctrl+S** (save) or **Ctrl+Q** (discard) — no terminal needed. Enter or Ctrl+C in the terminal that launched the recording still work too, and still ask save-or-discard there. The recording is written to a scratch file first, so discarding never touches the real output path, and a desktop notification is sent once `ffmpeg` finishes encoding (when `notify-send` is available).
+- Use the three-button toolbar on the recording border: **Save** finalizes the video, **Pause / Resume** suspends and continues capture without ending the session, and **Quit** discards the recording. While the border overlay has keyboard focus, **Space** toggles pause/resume, **Ctrl+S** saves, and **Ctrl+Q** discards. Enter or Ctrl+C in the terminal that launched the recording still ask whether to save or discard. The recording is written to a scratch file first, so discarding never touches the real output path, and a desktop notification is sent once `ffmpeg` finishes encoding (when `notify-send` is available).
 - A brief capture hiccup (e.g. a workspace-switch animation) no longer silently ends the recording — it keeps retrying for a couple of seconds before giving up, and if it does have to stop early you get a clear on-screen message and notification instead of the selection rectangle just lingering with no explanation.
 
 Video recording is optional and requires `ffmpeg`; it is not linked into the application.
@@ -405,8 +407,8 @@ Options:
 
       --no-border
       Disable the region border overlay. With --record, this also removes
-      the Ctrl+S/Ctrl+Q border-click controls, leaving Enter/Ctrl+C in the
-      terminal as the only way to stop.
+      the on-screen Save/Pause/Quit toolbar, leaving Enter/Ctrl+C in the
+      terminal as the way to stop and choose whether to save.
 
   -a, --algorithm <ALGORITHM>
       Stitching algorithm [default: opencv-orb].
@@ -457,10 +459,13 @@ Wayutils-Screen --help
 | Left mouse button + drag | Draw, or select a crop rectangle in crop mode |
 | `Up` / `Down` | Increase / decrease brush size |
 | `Left` / `Right` | Previous / next doodle colour |
+| `Ctrl+Z` | Undo the last doodle or eraser stroke |
+| `Ctrl+X` | Toggle the eraser on/off |
 | `c` | Toggle doodle/crop mode |
 | `Enter` | Apply the pending crop rectangle |
 | `Esc` | Cancel the pending crop, or quit if no crop is pending |
-| `s` | Save edits to the original file and quit |
+| `Ctrl+S` | Save edits to the original file and quit |
+| `Ctrl+C` | Copy the edited image to the clipboard and quit |
 | `q` | Quit without saving |
 
 ## Preview Fallback Controls

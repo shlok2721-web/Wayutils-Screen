@@ -6,12 +6,15 @@
 //! - Up / Down: increase / decrease the doodle brush size.
 //! - Left / Right: cycle through the color palette.
 //! - `c`: toggle crop mode.
+//! - `Ctrl+Z`: undo the last doodle/eraser stroke.
+//! - `Ctrl+X`: toggle the eraser.
 //! - Enter: apply the pending crop rectangle.
 //! - Escape: cancel a pending crop (or quit, if nothing is pending).
 //! - `Ctrl+S`: save (overwrites the original file) and exit.
 //! - `Ctrl+C`: copy the current image to the clipboard and exit.
 //! - `q`: quit without saving or copying.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -64,14 +67,13 @@ const DEFAULT_BRUSH_RADIUS: f32 = 6.0;
 const MIN_BRUSH_RADIUS: f32 = 2.0;
 const MAX_BRUSH_RADIUS: f32 = 60.0;
 const BRUSH_STEP: f32 = 2.0;
+const MAX_UNDO_STROKES: usize = 32;
+const MAX_UNDO_PIXELS: usize = 2_000_000;
 
-/// Dim backdrop (BGRA byte order, matching the icons' darkest gradient stop)
-/// shown around the image while editing, over the whole output - so it's
-/// visually obvious a modal edit session is active instead of the editor
-/// quietly floating over an unchanged desktop. The surface is still a
-/// translucent overlay rather than solid black, so the desktop underneath
-/// visibly *darkens* rather than disappears.
-const BACKDROP_BGRA: [u8; 4] = [0x41, 0x03, 0x08, 222];
+/// Neutral near-black charcoal backdrop (BGRA byte order) shown around the
+/// image while editing. The surface remains translucent so the desktop is
+/// dimmed without being completely hidden.
+const BACKDROP_BGRA: [u8; 4] = [0x17, 0x17, 0x17, 222];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -128,6 +130,7 @@ pub fn run(path: &Path) -> Result<()> {
     let pool = SlotPool::new((surface_w * surface_h * 4).max(4) as usize, &shm)
         .context("failed to create shm pool")?;
 
+    let original_canvas = canvas.clone();
     let display_buffer = build_display_buffer(
         &canvas, surface_w, surface_h, image_w, image_h, offset_x, offset_y, scale,
     );
@@ -150,7 +153,12 @@ pub fn run(path: &Path) -> Result<()> {
         exit: false,
         saved_or_copied: false,
         path: path.to_path_buf(),
+        original_canvas,
         canvas,
+        current_stroke: None,
+        undo_history: VecDeque::new(),
+        undo_pixels: 0,
+        eraser_active: false,
         scale,
         display_buffer,
         mode: Mode::Doodle,
@@ -172,9 +180,9 @@ pub fn run(path: &Path) -> Result<()> {
         .context("initial roundtrip failed")?;
 
     eprintln!(
-        "Edit mode: drag to doodle | Up/Down brush size | Left/Right color | c crop | \
-         Enter confirm crop | Esc cancel crop/quit | Ctrl+S save & exit | \
-         Ctrl+C copy to clipboard & exit | q quit without saving"
+        "Edit mode: drag to draw | Ctrl+Z undo | Ctrl+X eraser | Up/Down brush size | \
+         Left/Right color | c crop | Enter confirm crop | Esc cancel crop/quit | \
+         Ctrl+S save & exit | Ctrl+C copy to clipboard & exit | q quit without saving"
     );
 
     loop {
@@ -286,6 +294,23 @@ fn compute_image_placement(
     (image_w, image_h, offset_x, offset_y, scale)
 }
 
+#[derive(Clone, Copy)]
+struct PixelChange {
+    index: usize,
+    previous: [u8; 4],
+}
+
+#[derive(Default)]
+struct StrokeBuilder {
+    changes: Vec<PixelChange>,
+    seen: HashSet<usize>,
+    exceeded_limit: bool,
+}
+
+struct UndoStroke {
+    changes: Vec<PixelChange>,
+}
+
 struct EditorState {
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -315,9 +340,18 @@ struct EditorState {
     /// The file this editor was opened on; `Ctrl+S` overwrites this path.
     path: PathBuf,
 
-    /// The actual edited image, at full (post-crop) resolution. Doodles are
-    /// painted directly into this buffer.
+    /// Original pixels, kept untouched so erasing an annotation reveals the
+    /// screenshot instead of damaging it.
+    original_canvas: RgbaImage,
+    /// Editable output image. Erasing restores pixels from `original_canvas`;
+    /// no third full-resolution annotation buffer is allocated.
     canvas: RgbaImage,
+    /// Current in-progress stroke and bounded undo history. History stores
+    /// only pixels first touched by each stroke, never full-image snapshots.
+    current_stroke: Option<StrokeBuilder>,
+    undo_history: VecDeque<UndoStroke>,
+    undo_pixels: usize,
+    eraser_active: bool,
     /// display_px = canvas_px * scale.
     scale: f32,
 
@@ -352,6 +386,9 @@ struct EditorState {
 
 impl EditorState {
     fn current_color(&self) -> [u8; 4] {
+        if self.eraser_active {
+            return [0, 0, 0, 0];
+        }
         let c = PALETTE[self.color_index % PALETTE.len()];
         [c[0], c[1], c[2], 255]
     }
@@ -367,8 +404,7 @@ impl EditorState {
     }
 
     /// Whether a surface-local pointer position falls on the image itself,
-    /// rather than the dim backdrop around it - used to stop clicks in the
-    /// margin from doodling/cropping at the image's nearest edge pixel.
+    /// rather than the dim backdrop around it.
     fn position_within_image(&self, position: (f64, f64)) -> bool {
         let (x, y) = position;
         x >= self.offset_x as f64
@@ -377,18 +413,85 @@ impl EditorState {
             && y < (self.offset_y + self.image_h) as f64
     }
 
+    fn begin_stroke(&mut self) {
+        self.current_stroke = Some(StrokeBuilder::default());
+    }
+
+    fn commit_stroke(&mut self) {
+        let Some(stroke) = self.current_stroke.take() else {
+            return;
+        };
+        if stroke.exceeded_limit {
+            eprintln!("This stroke exceeded the undo memory limit and cannot be undone.");
+            return;
+        }
+        if stroke.changes.is_empty() {
+            return;
+        }
+
+        let pixels = stroke.changes.len();
+        while self.undo_history.len() >= MAX_UNDO_STROKES
+            || self.undo_pixels.saturating_add(pixels) > MAX_UNDO_PIXELS
+        {
+            let Some(oldest) = self.undo_history.pop_front() else {
+                break;
+            };
+            self.undo_pixels = self.undo_pixels.saturating_sub(oldest.changes.len());
+        }
+        self.undo_pixels = self.undo_pixels.saturating_add(pixels);
+        self.undo_history.push_back(UndoStroke {
+            changes: stroke.changes,
+        });
+    }
+
+    fn undo_last_stroke(&mut self) {
+        // A shortcut pressed during a drag ends that pointer stroke first;
+        // otherwise later motion events could continue drawing without a
+        // fresh history entry after the undo operation.
+        self.pointer_down = false;
+        self.last_canvas_point = None;
+        if let Some(active) = self.current_stroke.as_ref() {
+            let exceeded_limit = active.exceeded_limit;
+            let has_changes = !active.changes.is_empty();
+            self.commit_stroke();
+            // Do not unexpectedly undo an older completed stroke when the
+            // currently active gesture changed nothing or exceeded its cap.
+            if exceeded_limit || !has_changes {
+                eprintln!("Nothing to undo for the current stroke.");
+                return;
+            }
+        }
+        let Some(stroke) = self.undo_history.pop_back() else {
+            eprintln!("Nothing to undo.");
+            return;
+        };
+        self.undo_pixels = self.undo_pixels.saturating_sub(stroke.changes.len());
+        if let Some((x0, y0, x1, y1)) = restore_pixel_changes(&mut self.canvas, &stroke.changes) {
+            self.mark_dirty_canvas_rect(x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+        }
+    }
+
     fn paint_dot(&mut self, pt: (f32, f32)) {
+        if self.current_stroke.is_none() {
+            self.begin_stroke();
+        }
         let color = self.current_color();
         let r = self.brush_radius;
-        draw_filled_circle(&mut self.canvas, pt.0, pt.1, r, color);
+        draw_filled_circle_with_undo(
+            &mut self.canvas,
+            &self.original_canvas,
+            pt.0,
+            pt.1,
+            r,
+            color,
+            &mut self.current_stroke,
+        );
         self.mark_dirty_canvas_rect(pt.0 - r, pt.1 - r, pt.0 + r, pt.1 + r);
     }
 
-    /// Draws a continuous stroke from the last recorded point to `pt`,
-    /// stamping circles along the way so fast mouse movement still leaves an
-    /// unbroken line (same sensitivity as the raw cursor movement). Only the
-    /// bounding box actually touched by this segment is patched into the
-    /// display buffer - the rest of the image isn't re-scanned at all.
+    /// Draws a continuous stroke by stamping small circles. Only its dirty
+    /// rectangle is rescaled, keeping pointer-move cost
+    /// proportional to the brush/stroke segment rather than the full image.
     fn paint_stroke_to(&mut self, pt: (f32, f32)) {
         let Some(last) = self.last_canvas_point else {
             self.paint_dot(pt);
@@ -410,7 +513,15 @@ impl EditorState {
             let t = i as f32 / steps as f32;
             let x = last.0 + dx * t;
             let y = last.1 + dy * t;
-            draw_filled_circle(&mut self.canvas, x, y, r, color);
+            draw_filled_circle_with_undo(
+                &mut self.canvas,
+                &self.original_canvas,
+                x,
+                y,
+                r,
+                color,
+                &mut self.current_stroke,
+            );
         }
         self.last_canvas_point = Some(pt);
         self.mark_dirty_canvas_rect(min_x, min_y, max_x, max_y);
@@ -474,7 +585,15 @@ impl EditorState {
             return;
         }
         let cropped = image::imageops::crop_imm(&self.canvas, x0, y0, x1 - x0, y1 - y0).to_image();
+        self.original_canvas = image::imageops::crop_imm(
+            &self.original_canvas, x0, y0, x1 - x0, y1 - y0,
+        )
+        .to_image();
         self.canvas = cropped;
+        self.current_stroke = None;
+        self.undo_history.clear();
+        self.undo_pixels = 0;
+        self.eraser_active = false;
         self.mode = Mode::Doodle;
         self.recompute_layout(qh);
     }
@@ -619,8 +738,51 @@ impl EditorState {
     }
 }
 
-/// Paints a solid (non-anti-aliased) filled circle directly into the image.
-fn draw_filled_circle(img: &mut RgbaImage, cx: f32, cy: f32, radius: f32, color: [u8; 4]) {
+/// Restores a stroke's previous pixel values and returns its dirty bounds.
+/// The returned upper bounds are exclusive, matching `mark_dirty_canvas_rect`.
+fn restore_pixel_changes(
+    canvas: &mut RgbaImage,
+    changes: &[PixelChange],
+) -> Option<(u32, u32, u32, u32)> {
+    let width = canvas.width() as usize;
+    if width == 0 {
+        return None;
+    }
+
+    let raw = canvas.as_mut();
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    for change in changes {
+        let pixel = change.index / 4;
+        let x = (pixel % width) as u32;
+        let y = (pixel / width) as u32;
+        if change.index.saturating_add(4) <= raw.len() {
+            raw[change.index..change.index + 4].copy_from_slice(&change.previous);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+
+    (min_x != u32::MAX).then_some((min_x, min_y, max_x + 1, max_y + 1))
+}
+
+/// Paints a circle into the editable image. When `color` is transparent, the
+/// pixel is restored from the untouched source image (the eraser); this keeps
+/// erasing non-destructive without allocating another full-size layer.
+/// Each touched pixel's pre-stroke value is recorded once for bounded undo.
+fn draw_filled_circle_with_undo(
+    img: &mut RgbaImage,
+    original: &RgbaImage,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    color: [u8; 4],
+    stroke: &mut Option<StrokeBuilder>,
+) {
     let r = radius.max(1.0);
     let r2 = r * r;
     if img.width() == 0 || img.height() == 0 {
@@ -633,13 +795,41 @@ fn draw_filled_circle(img: &mut RgbaImage, cx: f32, cy: f32, radius: f32, color:
     if min_x > max_x || min_y > max_y {
         return;
     }
+
+    let width = img.width() as usize;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let dx = x as f32 + 0.5 - cx;
             let dy = y as f32 + 0.5 - cy;
-            if dx * dx + dy * dy <= r2 {
-                img.put_pixel(x as u32, y as u32, image::Rgba(color));
+            if dx * dx + dy * dy > r2 {
+                continue;
             }
+            let x = x as u32;
+            let y = y as u32;
+            let index = (y as usize * width + x as usize) * 4;
+            let previous = img.get_pixel(x, y).0;
+            let replacement = if color[3] == 0 {
+                original.get_pixel(x, y).0
+            } else {
+                color
+            };
+            // Do not allocate undo entries for pixels that the operation
+            // would leave unchanged (especially erasing untouched areas).
+            if previous == replacement {
+                continue;
+            }
+            if let Some(active) = stroke.as_mut() {
+                if !active.exceeded_limit && active.seen.insert(index) {
+                    if active.changes.len() >= MAX_UNDO_PIXELS {
+                        active.changes.clear();
+                        active.seen.clear();
+                        active.exceeded_limit = true;
+                    } else {
+                        active.changes.push(PixelChange { index, previous });
+                    }
+                }
+            }
+            img.put_pixel(x, y, image::Rgba(replacement));
         }
     }
 }
@@ -1021,12 +1211,28 @@ impl KeyboardHandler for EditorState {
         let is_c = matches!(keysym, Keysym::c | Keysym::C);
         let is_s = matches!(keysym, Keysym::s | Keysym::S);
         let is_q = matches!(keysym, Keysym::q | Keysym::Q);
+        let is_z = matches!(keysym, Keysym::z | Keysym::Z);
+        let is_x = matches!(keysym, Keysym::x | Keysym::X);
 
         if self.ctrl_held && is_s {
+            self.commit_stroke();
             self.quick_save();
         } else if self.ctrl_held && is_c {
+            self.commit_stroke();
             self.quick_copy();
+        } else if self.ctrl_held && is_z {
+            self.undo_last_stroke();
+            self.request_redraw(qh);
+        } else if self.ctrl_held && is_x {
+            self.eraser_active = !self.eraser_active;
+            eprintln!(
+                "{}",
+                if self.eraser_active { "Eraser enabled" } else { "Pen enabled" }
+            );
+            self.request_redraw(qh);
         } else if is_c {
+            self.commit_stroke();
+            self.eraser_active = false;
             self.mode = match self.mode {
                 Mode::Doodle => Mode::Crop,
                 Mode::Crop => Mode::Doodle,
@@ -1076,14 +1282,15 @@ impl PointerHandler for EditorState {
             }
             match event.kind {
                 PointerEventKind::Press { .. } => {
-                    self.pointer_down = true;
-                    // A click on the dim backdrop around the image (rather
-                    // than the image itself) shouldn't doodle or start a
-                    // crop at the image's nearest edge pixel.
-                    if self.position_within_image(event.position) {
+                    // Do not begin a stroke on the dark backdrop and then
+                    // accidentally paint when the pointer enters the image.
+                    self.pointer_down = self.position_within_image(event.position);
+                    self.last_canvas_point = None;
+                    if self.pointer_down {
                         let canvas_pt = self.to_canvas_point(event.position);
                         match self.mode {
                             Mode::Doodle => {
+                                self.begin_stroke();
                                 self.paint_dot(canvas_pt);
                                 self.last_canvas_point = Some(canvas_pt);
                             }
@@ -1098,6 +1305,7 @@ impl PointerHandler for EditorState {
                 PointerEventKind::Release { .. } => {
                     self.pointer_down = false;
                     self.last_canvas_point = None;
+                    self.commit_stroke();
                 }
                 PointerEventKind::Motion { .. } => {
                     self.cursor_display_pos = Some(event.position);
@@ -1141,4 +1349,92 @@ impl ProvidesRegistryState for EditorState {
     }
 
     registry_handlers!(OutputState, SeatState);
+}
+
+
+#[cfg(test)]
+mod editor_tests {
+    use super::{draw_filled_circle_with_undo, restore_pixel_changes, StrokeBuilder};
+    use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn eraser_restores_original_pixels() {
+        let original = RgbaImage::from_pixel(16, 16, Rgba([20, 40, 60, 255]));
+        let mut canvas = original.clone();
+        let mut stroke = Some(StrokeBuilder::default());
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 4.0, [200, 100, 50, 255], &mut stroke,
+        );
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 2.0, [0, 0, 0, 0], &mut stroke,
+        );
+        assert_eq!(canvas.get_pixel(8, 8).0, original.get_pixel(8, 8).0);
+        assert_eq!(canvas.get_pixel(4, 8).0, [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn undo_restores_previous_pixels_and_reports_dirty_bounds() {
+        let original = RgbaImage::from_pixel(16, 16, Rgba([20, 40, 60, 255]));
+        let mut canvas = original.clone();
+        let mut stroke = Some(StrokeBuilder::default());
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 3.0, [240, 10, 20, 255], &mut stroke,
+        );
+        let changes = stroke.expect("stroke history").changes;
+        let bounds = restore_pixel_changes(&mut canvas, &changes);
+        assert_eq!(bounds, Some((5, 5, 11, 11)));
+        assert_eq!(canvas, original);
+    }
+
+    #[test]
+    fn undoing_an_erase_restores_the_doodle_then_undoing_doodle_restores_source() {
+        let original = RgbaImage::from_pixel(16, 16, Rgba([20, 40, 60, 255]));
+        let mut canvas = original.clone();
+        let mut draw_stroke = Some(StrokeBuilder::default());
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 4.0, [200, 100, 50, 255], &mut draw_stroke,
+        );
+        let draw_changes = draw_stroke.expect("draw stroke").changes;
+
+        let mut erase_stroke = Some(StrokeBuilder::default());
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 2.0, [0, 0, 0, 0], &mut erase_stroke,
+        );
+        let erase_changes = erase_stroke.expect("erase stroke").changes;
+        assert_eq!(canvas.get_pixel(8, 8).0, original.get_pixel(8, 8).0);
+
+        restore_pixel_changes(&mut canvas, &erase_changes);
+        assert_eq!(canvas.get_pixel(8, 8).0, [200, 100, 50, 255]);
+        restore_pixel_changes(&mut canvas, &draw_changes);
+        assert_eq!(canvas, original);
+    }
+
+    #[test]
+    fn erasing_untouched_pixels_does_not_create_undo_entries() {
+        let original = RgbaImage::from_pixel(16, 16, Rgba([20, 40, 60, 255]));
+        let mut canvas = original.clone();
+        let mut stroke = Some(StrokeBuilder::default());
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 4.0, [0, 0, 0, 0], &mut stroke,
+        );
+        assert!(stroke.expect("active stroke").changes.is_empty());
+        assert_eq!(canvas, original);
+    }
+
+    #[test]
+    fn stroke_history_records_each_pixel_only_once() {
+        let original = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 255]));
+        let mut canvas = original.clone();
+        let mut stroke = Some(StrokeBuilder::default());
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 4.0, [255, 0, 0, 255], &mut stroke,
+        );
+        draw_filled_circle_with_undo(
+            &mut canvas, &original, 8.0, 8.0, 4.0, [0, 255, 0, 255], &mut stroke,
+        );
+        let active = stroke.expect("active stroke");
+        assert_eq!(active.changes.len(), active.seen.len());
+        assert!(!active.changes.is_empty());
+        assert!(active.changes.iter().all(|change| change.previous == [0, 0, 0, 255]));
+    }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Once;
 
 use image::{GrayImage, RgbaImage};
@@ -86,6 +87,7 @@ pub(super) fn estimate_orb_offset(
 
     let mut curr_points = Vector::<Point2f>::new();
     let mut prev_points = Vector::<Point2f>::new();
+    let mut motion_votes = Vec::<(f64, f64, f64)>::new();
     let mut raw_matches = 0usize;
 
     // 3. 使用比率测试和垂直滚动约束筛选特征匹配
@@ -106,11 +108,15 @@ pub(super) fn estimate_orb_offset(
         let dx = (prev_pt.x - curr_pt.x) as f64;
         let dy = (prev_pt.y - curr_pt.y) as f64;
 
-        // `dy` > 0 means the view scrolled down (content moved up on
-        // screen); `dy` < 0 means it scrolled up. Both are valid scroll
-        // directions - only reject near-zero motion and large horizontal
-        // drift (which would indicate a bad match rather than scrolling).
-        if dy.abs() <= 1.0 || dx.abs() > ORB_MAX_DX * 2.0 {
+        // Keep plausible feature matches even when `dy` is nearly zero:
+        // stationary matches can identify a monitor or pane that is not
+        // moving while another horizontal part of the selection is moving.
+        // Only non-zero motion matches are used by RANSAC below.
+        if dx.abs() > ORB_MAX_DX * 2.0 {
+            continue;
+        }
+        motion_votes.push((dy, curr_pt.x as f64, curr_pt.y as f64));
+        if dy.abs() <= 1.0 {
             continue;
         }
 
@@ -119,6 +125,42 @@ pub(super) fn estimate_orb_offset(
         raw_matches += 1;
     }
 
+    // A single screenshot rectangle can cross two independent displays or
+    // two independently scrolling panes. In that case there is no single
+    // valid vertical offset for the whole frame. Accepting whichever motion
+    // happens to win RANSAC can repeatedly append the wrong monitor/pane.
+    // Return a deliberately rejected estimate (very high confidence cost)
+    // so the caller preserves its current anchor instead of falling through
+    // to a weaker matcher that might guess a different offset.
+    if has_conflicting_motion_modes(
+        &motion_votes,
+        prev.width() as f64,
+        prev.height() as f64,
+    ) {
+        log::warn!(
+            "【OpenCV ORB】检测到多个独立的垂直运动区域；本帧不参与拼接，避免重复追加"
+        );
+        return Ok(Some(OrbEstimate {
+            dy: 0.0,
+            confidence: f32::MAX,
+        }));
+    }
+    if raw_matches < ORB_MIN_MATCHES
+        && has_dominant_stationary_mode(
+            &motion_votes,
+            raw_matches,
+            prev.width() as f64,
+            prev.height() as f64,
+        )
+    {
+        // A broad, well-supported zero-motion match is stronger evidence
+        // than a template fallback on repetitive content. Report no movement
+        // so the caller does not invent a scroll offset and duplicate pixels.
+        return Ok(Some(OrbEstimate {
+            dy: 0.0,
+            confidence: 0.0,
+        }));
+    }
     if raw_matches < ORB_MIN_MATCHES {
         return Ok(None);
     }
@@ -181,6 +223,204 @@ pub(super) fn estimate_orb_offset(
         + (geom_drift as f32 * 6.0);
 
     Ok(Some(OrbEstimate { dy: ty, confidence }))
+}
+
+
+/// Returns true when stationary descriptor matches dominate the frame and
+/// cover a broad two-dimensional area. This prevents a template fallback from
+/// inventing motion for an otherwise unchanged frame, while avoiding a small
+/// fixed header being mistaken for a fully stationary page.
+fn has_dominant_stationary_mode(
+    votes: &[(f64, f64, f64)],
+    moving_matches: usize,
+    frame_width: f64,
+    frame_height: f64,
+) -> bool {
+    if frame_width <= 0.0 || frame_height <= 0.0 {
+        return false;
+    }
+
+    let stationary: Vec<(f64, f64)> = votes
+        .iter()
+        .filter_map(|&(dy, x, y)| (dy.abs() <= 1.0).then_some((x, y)))
+        .collect();
+    if stationary.len() < ORB_MIN_INLIERS
+        || stationary.len() < moving_matches.saturating_mul(2)
+    {
+        return false;
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for (x, y) in stationary {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    (max_x - min_x) >= frame_width * 0.15
+        && (max_y - min_y) >= frame_height * 0.15
+}
+
+/// Detects two well-supported, spatially separated vertical-motion modes.
+/// `votes` contains `(vertical displacement, current-frame x, y)` for
+/// plausible descriptor matches, including stationary matches. This catches
+/// independent horizontal or vertical display regions before one global
+/// offset is estimated.
+fn has_conflicting_motion_modes(
+    votes: &[(f64, f64, f64)],
+    frame_width: f64,
+    frame_height: f64,
+) -> bool {
+    if votes.len() < ORB_MIN_INLIERS || frame_width <= 0.0 || frame_height <= 0.0 {
+        return false;
+    }
+
+    // Eight-pixel bins absorb normal keypoint localization jitter while
+    // keeping genuinely different scroll offsets separate.
+    let mut bins: HashMap<i64, Vec<(f64, f64)>> = HashMap::new();
+    for &(dy, x, y) in votes {
+        let bin = (dy / 8.0).round() as i64;
+        bins.entry(bin).or_default().push((x, y));
+    }
+
+    // Keep each mode's spatial extent as well as its centre. A fixed web-page
+    // header and the scrolling body can have different dy values, but the
+    // header is a narrow horizontal band; it must not look like a second
+    // independently moving monitor/pane.
+    let mut modes: Vec<(usize, f64, f64, f64, f64)> = bins
+        .into_values()
+        .filter_map(|points| {
+            let count = points.len();
+            if count < ORB_MIN_INLIERS / 2 {
+                return None;
+            }
+            let (mut sum_x, mut sum_y) = (0.0, 0.0);
+            let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+            let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &(x, y) in &points {
+                sum_x += x;
+                sum_y += y;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+            Some((
+                count,
+                sum_x / count as f64,
+                sum_y / count as f64,
+                max_x - min_x,
+                max_y - min_y,
+            ))
+        })
+        .collect();
+    modes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+    let Some(&(largest_count, largest_x, largest_y, largest_span_x, largest_span_y)) = modes.first() else {
+        return false;
+    };
+    let Some(&(second_count, second_x, second_y, second_span_x, second_span_y)) = modes.get(1) else {
+        return false;
+    };
+
+    let separated_horizontally =
+        (largest_x - second_x).abs() >= frame_width * 0.20
+            && largest_span_x >= frame_width * 0.10
+            && second_span_x >= frame_width * 0.10;
+    let separated_vertically =
+        (largest_y - second_y).abs() >= frame_height * 0.20
+            && largest_span_y >= frame_height * 0.15
+            && second_span_y >= frame_height * 0.15;
+
+    second_count >= ORB_MIN_INLIERS / 2
+        && second_count.saturating_mul(4) >= largest_count
+        && (separated_horizontally || separated_vertically)
+}
+
+#[cfg(test)]
+mod motion_mode_tests {
+    use super::{has_conflicting_motion_modes, has_dominant_stationary_mode};
+
+    #[test]
+    fn detects_two_independent_scroll_areas_on_separate_sides() {
+        let mut votes = Vec::new();
+        for i in 0..40 {
+            votes.push((120.0 + (i % 3) as f64, 100.0 + (i * 17 % 700) as f64, 300.0));
+            votes.push((260.0 + (i % 3) as f64, 1100.0 + (i * 17 % 700) as f64, 300.0));
+        }
+        assert!(has_conflicting_motion_modes(&votes, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn detects_stationary_monitor_beside_scrolling_monitor() {
+        let mut votes = Vec::new();
+        for i in 0..40 {
+            votes.push((0.0, 100.0 + (i * 17 % 700) as f64, 300.0));
+            votes.push((160.0 + (i % 3) as f64, 1100.0 + (i * 17 % 700) as f64, 300.0));
+        }
+        assert!(has_conflicting_motion_modes(&votes, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn detects_independent_regions_stacked_vertically() {
+        let mut votes = Vec::new();
+        for i in 0..40 {
+            votes.push((0.0, 900.0, 80.0 + (i * 13 % 430) as f64));
+            votes.push((140.0 + (i % 3) as f64, 900.0, 650.0 + (i * 13 % 430) as f64));
+        }
+        assert!(has_conflicting_motion_modes(&votes, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn does_not_confuse_fixed_header_with_a_second_display() {
+        let mut votes = Vec::new();
+        for i in 0..40 {
+            votes.push((0.0, (i * 47 % 1800) as f64, 24.0 + (i % 4) as f64));
+            votes.push((160.0 + (i % 3) as f64, (i * 43 % 1800) as f64, 250.0 + (i * 19 % 700) as f64));
+        }
+        assert!(!has_conflicting_motion_modes(&votes, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn accepts_one_scroll_area_with_normal_match_jitter() {
+        let votes: Vec<_> = (0..80)
+            .map(|i| (
+                180.0 + (i % 5) as f64,
+                (i * 19 % 1900) as f64,
+                (i * 13 % 1050) as f64,
+            ))
+            .collect();
+        assert!(!has_conflicting_motion_modes(&votes, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn recognizes_a_broad_static_frame_instead_of_using_template_fallback() {
+        let votes: Vec<_> = (0..80)
+            .map(|i| (0.0, (i * 31 % 1900) as f64, (i * 17 % 1050) as f64))
+            .collect();
+        assert!(has_dominant_stationary_mode(&votes, 2, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn does_not_treat_a_narrow_fixed_header_as_a_static_frame() {
+        let votes: Vec<_> = (0..60)
+            .map(|i| (0.0, (i * 31 % 1900) as f64, (i % 5 * 2) as f64))
+            .collect();
+        assert!(!has_dominant_stationary_mode(&votes, 20, 1920.0, 1080.0));
+    }
+
+    #[test]
+    fn ignores_small_secondary_motion_cluster() {
+        let mut votes: Vec<_> = (0..60)
+            .map(|i| (180.0, (i * 20 % 900) as f64, 300.0))
+            .collect();
+        votes.extend((0..8).map(|i| (300.0, 1200.0 + i as f64, 300.0)));
+        assert!(!has_conflicting_motion_modes(&votes, 1920.0, 1080.0));
+    }
 }
 
 /// 将灰度图复制到 OpenCV 矩阵

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -129,31 +129,74 @@ fn output_id(output: &wl_output::WlOutput) -> Option<u32> {
         .map(|data| data.with_output_info(|info| info.id))
 }
 
-fn draw_recording_toolbar(canvas: &mut [u8], width: u32, height: u32, hover: Option<u32>, paused: bool) {
+fn recording_toolbar_icons() -> &'static [Option<image::RgbaImage>; 3] {
+    static ICONS: OnceLock<[Option<image::RgbaImage>; 3]> = OnceLock::new();
+    ICONS.get_or_init(|| {
+        let bytes: [&[u8]; 3] = [
+            include_bytes!("../assets/icons/save.png"),
+            include_bytes!("../assets/icons/orb.png"),
+            include_bytes!("../assets/icons/logout.png"),
+        ];
+        bytes
+        .map(|bytes| {
+            image::load_from_memory(bytes).ok().map(|decoded| {
+                image::imageops::resize(
+                    &decoded.to_rgba8(),
+                    24,
+                    24,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            })
+        })
+    })
+}
+
+fn draw_recording_toolbar(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    hover: Option<u32>,
+    paused: bool,
+) {
     let bar_h = CONTROL_BAR_HEIGHT.min(height);
     let bar_y = height.saturating_sub(bar_h);
     fill_rect(canvas, width, 0, bar_y, width, bar_h, [24, 24, 28, 245]);
     let segment = (width / 3).max(1);
-    let icons: [&[u8]; 3] = [
-        include_bytes!("../assets/icons/save.png"),
-        include_bytes!("../assets/icons/orb.png"),
-        include_bytes!("../assets/icons/logout.png"),
-    ];
+    let icons = recording_toolbar_icons();
     for index in 0..3u32 {
         let x0 = index * segment;
         let x1 = if index == 2 { width } else { (index + 1) * segment };
-        let bg = if hover == Some(index) { [250, 249, 255, 255] } else { [228, 226, 255, 244] };
-        fill_rect(canvas, width, x0 + 3, bar_y + 3, x1.saturating_sub(x0 + 6), bar_h.saturating_sub(6), bg);
+        let bg = if hover == Some(index) {
+            [250, 249, 255, 255]
+        } else {
+            [228, 226, 255, 244]
+        };
+        fill_rect(
+            canvas,
+            width,
+            x0 + 3,
+            bar_y + 3,
+            x1.saturating_sub(x0 + 6),
+            bar_h.saturating_sub(6),
+            bg,
+        );
         if index == 1 && paused {
             // Replace the pause glyph with a simple play triangle on resume.
             let cx = x0 + (x1 - x0) / 2;
             let cy = bar_y + bar_h / 2;
             for row in 0..14u32 {
                 let half = row / 2;
-                fill_rect(canvas, width, cx.saturating_sub(5), cy.saturating_sub(7) + row, 6 + half, 1, [52, 45, 110, 255]);
+                fill_rect(
+                    canvas,
+                    width,
+                    cx.saturating_sub(5),
+                    cy.saturating_sub(7) + row,
+                    6 + half,
+                    1,
+                    [52, 45, 110, 255],
+                );
             }
-        } else if let Ok(icon) = image::load_from_memory(icons[index as usize]) {
-            let icon = image::imageops::resize(&icon.to_rgba8(), 24, 24, image::imageops::FilterType::Lanczos3);
+        } else if let Some(icon) = &icons[index as usize] {
             let ix = x0 + (x1 - x0).saturating_sub(24) / 2;
             let iy = bar_y + bar_h.saturating_sub(24) / 2;
             for sy in 0..24u32 {
@@ -161,12 +204,18 @@ fn draw_recording_toolbar(canvas: &mut [u8], width: u32, height: u32, hover: Opt
                     let px = icon.get_pixel(sx, sy).0;
                     let dx = ix + sx;
                     let dy = iy + sy;
-                    if dx >= width || dy >= height { continue; }
+                    if dx >= width || dy >= height {
+                        continue;
+                    }
                     let dst = ((dy * width + dx) * 4) as usize;
                     let a = px[3] as u32;
-                    if a == 0 || dst + 3 >= canvas.len() { continue; }
+                    if a == 0 || dst + 3 >= canvas.len() {
+                        continue;
+                    }
                     for c in 0..3 {
-                        canvas[dst + c] = ((px[2 - c] as u32 * a + canvas[dst + c] as u32 * (255 - a)) / 255) as u8;
+                        canvas[dst + c] = ((px[2 - c] as u32 * a
+                            + canvas[dst + c] as u32 * (255 - a))
+                            / 255) as u8;
                     }
                     canvas[dst + 3] = 255;
                 }

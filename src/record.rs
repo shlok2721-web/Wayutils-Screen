@@ -90,9 +90,9 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     // afterwards, the real output path is never touched.
     let temp_path = temp_recording_path(&final_path);
 
-    // Visual indicator of the recorded area; best-effort only. When it's
-    // available, its border strip is also clickable: click it, then Ctrl+S
-    // stops and saves, Ctrl+Q stops and discards - no terminal required.
+    // Visual indicator of the recorded area; best-effort only. When it is
+    // available, the border contains a three-button Save/Pause/Quit toolbar.
+    // Ctrl+S and Ctrl+Q remain available as keyboard alternatives.
     let (mut border, recording_rx) = if args.no_border {
         (None, None)
     } else {
@@ -156,7 +156,7 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let mut encode_failed = false;
     let mut capture_lost = false;
     let mut paused = false;
-    // `Some(decision)` once the border's Ctrl+S/Ctrl+Q has already answered
+    // `Some(decision)` once the border toolbar or Ctrl+S/Ctrl+Q has answered
     // the save/discard question - set below whenever `poll_stop` sees one of
     // those come in. Stopping via Enter/Ctrl+C or losing the capture region
     // leaves this `None`, which means "still ask" (see `prompt_save_or_discard`).
@@ -378,7 +378,7 @@ fn should_stop(stop_from_stdin: &Arc<AtomicBool>) -> bool {
 
 /// Polls every way the recording can be asked to stop. Returns `None` while
 /// recording should continue. Returns `Some(Some(decision))` once the
-/// border's Ctrl+S/Ctrl+Q has already answered the save/discard question -
+/// border toolbar or Ctrl+S/Ctrl+Q has already answered the save/discard question -
 /// or `Some(None)` when the stop instead came from Enter, Ctrl+C, so the
 /// save/discard question still needs asking (see `prompt_save_or_discard`).
 fn poll_stop(

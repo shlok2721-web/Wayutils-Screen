@@ -352,7 +352,9 @@ fn spawn_capture_worker(
                     let now = Instant::now();
                     last_capture_end = Some(now);
 
-                    let signature = frame_signature(&frame, SIGNATURE_COLS, SIGNATURE_ROWS);
+                    let (signature_cols, signature_rows) =
+                        signature_grid_size(frame.width(), frame.height());
+                    let signature = frame_signature(&frame, signature_cols, signature_rows);
                     if let Some(previous) = last_signature.as_ref() {
                         if is_duplicate_signature(previous, &signature) {
                             update_status(
@@ -516,6 +518,19 @@ fn update_status(
     st.revision = st.revision.wrapping_add(1);
 }
 
+
+fn signature_grid_size(width: u32, height: u32) -> (u32, u32) {
+    let aspect = width.max(1) as f32 / height.max(1) as f32;
+    let reference_aspect = 16.0 / 9.0;
+    let cols = (SIGNATURE_COLS as f32 * (aspect / reference_aspect).max(1.0))
+        .round()
+        .clamp(SIGNATURE_COLS as f32, 64.0) as u32;
+    let rows = (SIGNATURE_ROWS as f32 * (reference_aspect / aspect).max(1.0))
+        .round()
+        .clamp(SIGNATURE_ROWS as f32, 64.0) as u32;
+    (cols, rows)
+}
+
 fn frame_signature(frame: &RgbaImage, cols: u32, rows: u32) -> Vec<u8> {
     let width = frame.width().max(1);
     let height = frame.height().max(1);
@@ -523,14 +538,34 @@ fn frame_signature(frame: &RgbaImage, cols: u32, rows: u32) -> Vec<u8> {
     let rows = rows.max(1);
     let mut signature = Vec::with_capacity((cols * rows) as usize);
 
+    // A single pixel per cell is too fragile: a small animation or text
+    // change can fall between sample points and make a changing frame look
+    // identical. Average a tiny 5x5 patch around each cell centre instead.
+    // This samples only 25 * cols * rows pixels, so the duplicate check remains
+    // negligible compared with capture and feature matching.
     for row in 0..rows {
-        let y = ((row * height) / rows).min(height - 1);
+        let cell_y0 = row * height / rows;
+        let cell_y1 = ((row + 1) * height / rows).max(cell_y0 + 1).min(height);
+        let center_y = ((cell_y0 + cell_y1) / 2).min(height - 1);
         for col in 0..cols {
-            let x = ((col * width) / cols).min(width - 1);
-            let pixel = frame.get_pixel(x, y);
-            let gray =
-                (0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32) as u8;
-            signature.push(gray);
+            let cell_x0 = col * width / cols;
+            let cell_x1 = ((col + 1) * width / cols).max(cell_x0 + 1).min(width);
+            let center_x = ((cell_x0 + cell_x1) / 2).min(width - 1);
+            let mut gray_sum = 0u32;
+            let mut samples = 0u32;
+            for oy in -2i32..=2 {
+                for ox in -2i32..=2 {
+                    let x = (center_x as i32 + ox).clamp(0, width as i32 - 1) as u32;
+                    let y = (center_y as i32 + oy).clamp(0, height as i32 - 1) as u32;
+                    let pixel = frame.get_pixel(x, y);
+                    let gray = 0.299 * pixel[0] as f32
+                        + 0.587 * pixel[1] as f32
+                        + 0.114 * pixel[2] as f32;
+                    gray_sum += gray.round() as u32;
+                    samples += 1;
+                }
+            }
+            signature.push((gray_sum / samples.max(1)) as u8);
         }
     }
 
@@ -724,5 +759,41 @@ mod tests {
     #[test]
     fn no_control_surface_fails_after_action_error() {
         assert!(should_fail_on_action_error(false, false, false));
+    }
+}
+
+
+#[cfg(test)]
+mod signature_tests {
+    use super::{frame_signature, is_duplicate_signature, signature_grid_size};
+    use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn detects_local_change_near_a_sample_centre() {
+        let before = RgbaImage::from_pixel(20, 20, Rgba([30, 30, 30, 255]));
+        let mut after = before.clone();
+        // With a 2x2 grid, the first cell centre is around (5, 5). This pixel
+        // would be missed by a single-point sampler but belongs to its 3x3 patch.
+        after.put_pixel(6, 5, Rgba([240, 240, 240, 255]));
+        let a = frame_signature(&before, 2, 2);
+        let b = frame_signature(&after, 2, 2);
+        assert!(!is_duplicate_signature(&a, &b));
+    }
+
+    #[test]
+    fn wide_multi_monitor_frames_get_more_horizontal_samples() {
+        let (normal_cols, normal_rows) = signature_grid_size(1920, 1080);
+        let (wide_cols, wide_rows) = signature_grid_size(3840, 1080);
+        assert_eq!((normal_cols, normal_rows), (18, 24));
+        assert_eq!(wide_rows, normal_rows);
+        assert!(wide_cols > normal_cols);
+    }
+
+    #[test]
+    fn identical_frames_have_identical_signatures() {
+        let frame = RgbaImage::from_pixel(64, 48, Rgba([90, 120, 150, 255]));
+        let a = frame_signature(&frame, 18, 24);
+        let b = frame_signature(&frame, 18, 24);
+        assert!(is_duplicate_signature(&a, &b));
     }
 }
