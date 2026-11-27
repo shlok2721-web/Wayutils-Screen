@@ -75,15 +75,13 @@ pub struct StitchState {
     pub last_error: Option<String>,
 }
 
-/// Sent by the recording border overlay's keyboard handling (`--record`).
-/// Ctrl+S always means "stop and keep it", Ctrl+Q always means "stop and
-/// throw it away" - the same convention as `q` elsewhere in the app, just
-/// with Ctrl so it can't be triggered by typing into whatever's behind the
-/// border while it's being recorded.
+/// Commands sent by the recording overlay (`--record`). Save and Discard
+/// finish the recording; TogglePause suspends or resumes the encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordingCommand {
     Save,
     Discard,
+    TogglePause,
 }
 
 #[derive(Clone, Debug)]

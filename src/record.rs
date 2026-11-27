@@ -7,9 +7,8 @@
 //! required (and only invoked) when the user actually asks to record.
 //!
 //! The recording is always written to a temporary file first, so discarding
-//! it never touches the real output path. It can be stopped three ways:
-//! clicking the border's strip then pressing Ctrl+S (save) or Ctrl+Q
-//! (discard) - no terminal needed; pressing Enter or Ctrl+C in the terminal
+//! it never touches the real output path. The on-screen toolbar provides
+//! Save, Pause/Resume, and Quit controls; Enter or Ctrl+C in the terminal
 //! that launched it, which still asks save-or-discard there; or losing the
 //! capture region for too long (e.g. the output got disconnected), which
 //! stops it automatically. Once `ffmpeg` finishes encoding, a desktop
@@ -143,8 +142,7 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let stop_from_stdin = spawn_stdin_stop_watcher();
 
     eprintln!(
-        "Recording {}x{} @ {}fps{} - click the border then Ctrl+S to save / Ctrl+Q to discard, \
-         or press Enter/Ctrl+C here to stop and be asked",
+        "Recording {}x{} @ {}fps{} - use the on-screen Save / Pause / Quit controls, or press Enter/Ctrl+C here to stop and be asked",
         capture_w,
         capture_h,
         fps,
@@ -157,6 +155,7 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let started_at = Instant::now();
     let mut encode_failed = false;
     let mut capture_lost = false;
+    let mut paused = false;
     // `Some(decision)` once the border's Ctrl+S/Ctrl+Q has already answered
     // the save/discard question - set below whenever `poll_stop` sees one of
     // those come in. Stopping via Enter/Ctrl+C or losing the capture region
@@ -171,9 +170,13 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     let mut consecutive_capture_failures: u32 = 0;
 
     loop {
-        if let Some(decision) = poll_stop(&stop_from_stdin, recording_rx.as_ref()) {
+        if let Some(decision) = poll_stop(&stop_from_stdin, recording_rx.as_ref(), &mut child, &mut paused) {
             explicit_decision = decision;
             break;
+        }
+        if paused {
+            thread::sleep(Duration::from_millis(20));
+            continue;
         }
 
         let tick_start = Instant::now();
@@ -194,9 +197,12 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
             thread::sleep(frame_interval - elapsed);
         }
 
-        if let Some(decision) = poll_stop(&stop_from_stdin, recording_rx.as_ref()) {
+        if let Some(decision) = poll_stop(&stop_from_stdin, recording_rx.as_ref(), &mut child, &mut paused) {
             explicit_decision = decision;
             break;
+        }
+        if paused {
+            continue;
         }
 
         match capturer.capture(&region) {
@@ -232,6 +238,12 @@ fn run_with_region(args: &Args, config: &Config, region: Region) -> Result<()> {
     // stop capturing, rather than after waiting on ffmpeg to finish
     // encoding below - the whole point is that it shouldn't look like
     // recording is still happening once it isn't.
+    // A paused ffmpeg process must be continued before closing its stdin;
+    // otherwise wait() below would block forever on a stopped child.
+    if paused {
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGCONT); }
+        paused = false;
+    }
     if let Some(ref mut overlay) = border {
         overlay.stop();
     }
@@ -372,12 +384,25 @@ fn should_stop(stop_from_stdin: &Arc<AtomicBool>) -> bool {
 fn poll_stop(
     stop_from_stdin: &Arc<AtomicBool>,
     recording_rx: Option<&mpsc::Receiver<RecordingCommand>>,
+    child: &mut Child,
+    paused: &mut bool,
 ) -> Option<Option<SaveDecision>> {
     if let Some(rx) = recording_rx {
-        match rx.try_recv() {
-            Ok(RecordingCommand::Save) => return Some(Some(SaveDecision::Save)),
-            Ok(RecordingCommand::Discard) => return Some(Some(SaveDecision::Discard)),
-            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
+        loop {
+            match rx.try_recv() {
+                Ok(RecordingCommand::Save) => return Some(Some(SaveDecision::Save)),
+                Ok(RecordingCommand::Discard) => return Some(Some(SaveDecision::Discard)),
+                Ok(RecordingCommand::TogglePause) => {
+                    let signal = if *paused { libc::SIGCONT } else { libc::SIGSTOP };
+                    if unsafe { libc::kill(child.id() as libc::pid_t, signal) } == 0 {
+                        *paused = !*paused;
+                    } else {
+                        log::warn!("failed to {} recording process: {}", if *paused { "resume" } else { "pause" }, io::Error::last_os_error());
+                        *paused = false;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
         }
     }
     if should_stop(stop_from_stdin) {

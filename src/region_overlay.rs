@@ -6,13 +6,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
     output::{OutputData, OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -26,11 +27,11 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_region, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface},
     Connection, Proxy, QueueHandle,
 };
 
-use crate::constants::{REGION_BORDER_COLOR, REGION_BORDER_WIDTH};
+use crate::constants::{CONTROL_BAR_HEIGHT, REGION_BORDER_COLOR, REGION_BORDER_WIDTH};
 use crate::types::{Region, RecordingCommand};
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +129,52 @@ fn output_id(output: &wl_output::WlOutput) -> Option<u32> {
         .map(|data| data.with_output_info(|info| info.id))
 }
 
+fn draw_recording_toolbar(canvas: &mut [u8], width: u32, height: u32, hover: Option<u32>, paused: bool) {
+    let bar_h = CONTROL_BAR_HEIGHT.min(height);
+    let bar_y = height.saturating_sub(bar_h);
+    fill_rect(canvas, width, 0, bar_y, width, bar_h, [24, 24, 28, 245]);
+    let segment = (width / 3).max(1);
+    let icons: [&[u8]; 3] = [
+        include_bytes!("../assets/icons/save.png"),
+        include_bytes!("../assets/icons/orb.png"),
+        include_bytes!("../assets/icons/logout.png"),
+    ];
+    for index in 0..3u32 {
+        let x0 = index * segment;
+        let x1 = if index == 2 { width } else { (index + 1) * segment };
+        let bg = if hover == Some(index) { [250, 249, 255, 255] } else { [228, 226, 255, 244] };
+        fill_rect(canvas, width, x0 + 3, bar_y + 3, x1.saturating_sub(x0 + 6), bar_h.saturating_sub(6), bg);
+        if index == 1 && paused {
+            // Replace the pause glyph with a simple play triangle on resume.
+            let cx = x0 + (x1 - x0) / 2;
+            let cy = bar_y + bar_h / 2;
+            for row in 0..14u32 {
+                let half = row / 2;
+                fill_rect(canvas, width, cx.saturating_sub(5), cy.saturating_sub(7) + row, 6 + half, 1, [52, 45, 110, 255]);
+            }
+        } else if let Ok(icon) = image::load_from_memory(icons[index as usize]) {
+            let icon = image::imageops::resize(&icon.to_rgba8(), 24, 24, image::imageops::FilterType::Lanczos3);
+            let ix = x0 + (x1 - x0).saturating_sub(24) / 2;
+            let iy = bar_y + bar_h.saturating_sub(24) / 2;
+            for sy in 0..24u32 {
+                for sx in 0..24u32 {
+                    let px = icon.get_pixel(sx, sy).0;
+                    let dx = ix + sx;
+                    let dy = iy + sy;
+                    if dx >= width || dy >= height { continue; }
+                    let dst = ((dy * width + dx) * 4) as usize;
+                    let a = px[3] as u32;
+                    if a == 0 || dst + 3 >= canvas.len() { continue; }
+                    for c in 0..3 {
+                        canvas[dst + c] = ((px[2 - c] as u32 * a + canvas[dst + c] as u32 * (255 - a)) / 255) as u8;
+                    }
+                    canvas[dst + 3] = 255;
+                }
+            }
+        }
+    }
+}
+
 fn find_output_by_id(output_state: &OutputState, id: u32) -> Option<wl_output::WlOutput> {
     output_state
         .outputs()
@@ -170,14 +217,9 @@ impl RegionOverlay {
         Self::spawn(region, None)
     }
 
-    /// Like [`RegionOverlay::new`], but the border strip itself (not the
-    /// recorded interior, which stays click-through so the recording can
-    /// still be interacted with normally) is clickable: clicking it gives
-    /// the border keyboard focus, after which Ctrl+S sends
-    /// [`RecordingCommand::Save`] and Ctrl+Q sends
-    /// [`RecordingCommand::Discard`] on the returned channel. Used for
-    /// `--record`, so stopping a recording doesn't require switching to a
-    /// terminal.
+    /// Like [`RegionOverlay::new`], but adds a clickable three-button
+    /// toolbar along the bottom edge. The rest of the recorded interior
+    /// remains click-through.
     pub fn new_for_recording(region: Region) -> Result<(Self, mpsc::Receiver<RecordingCommand>)> {
         let (tx, rx) = mpsc::channel();
         let overlay = Self::spawn(region, Some(tx))?;
@@ -235,6 +277,9 @@ struct RegionBorder {
     exit: bool,
 
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    hover_button: Option<u32>,
+    paused: bool,
     /// Tracks whether Ctrl is currently held, so Ctrl+S/Ctrl+Q can be told
     /// apart from the plain `s`/`q` letter keys (which should do nothing
     /// here - this border is only ever focused deliberately, by clicking
@@ -282,6 +327,9 @@ impl RegionBorder {
 
         canvas.fill(0);
         draw_border(canvas, self.width, self.height);
+        if self.command_tx.is_some() {
+            draw_recording_toolbar(canvas, self.width, self.height, self.hover_button, self.paused);
+        }
 
         layer
             .wl_surface()
@@ -419,6 +467,12 @@ impl SeatHandler for RegionBorder {
                 self.keyboard = Some(keyboard);
             }
         }
+
+        if self.command_tx.is_some() && capability == Capability::Pointer && self.pointer.is_none() {
+            if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
+                self.pointer = Some(pointer);
+            }
+        }
     }
 
     fn remove_capability(
@@ -431,6 +485,11 @@ impl SeatHandler for RegionBorder {
         if capability == Capability::Keyboard {
             if let Some(keyboard) = self.keyboard.take() {
                 keyboard.release();
+            }
+        }
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
             }
         }
     }
@@ -464,7 +523,7 @@ impl KeyboardHandler for RegionBorder {
     fn press_key(
         &mut self,
         _: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
         event: KeyEvent,
@@ -472,13 +531,16 @@ impl KeyboardHandler for RegionBorder {
         let Some(tx) = &self.command_tx else {
             return;
         };
+        if event.keysym == Keysym::space {
+            let _ = tx.send(RecordingCommand::TogglePause);
+            self.paused = !self.paused;
+            self.draw(qh);
+            return;
+        }
         if !self.ctrl_held {
             return;
         }
-        // Keysyms for letter keys are unaffected by the Ctrl modifier in xkb
-        // (only Shift changes which letter keysym is reported), so matching
-        // on the keysym plus `self.ctrl_held` reliably tells Ctrl+S/Ctrl+Q
-        // apart from the plain letters.
+        // Ctrl+S saves and Ctrl+Q discards; ordinary typing is left alone.
         if matches!(event.keysym, Keysym::s | Keysym::S) {
             let _ = tx.send(RecordingCommand::Save);
         } else if matches!(event.keysym, Keysym::q | Keysym::Q) {
@@ -509,12 +571,71 @@ impl KeyboardHandler for RegionBorder {
     }
 }
 
+impl PointerHandler for RegionBorder {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            let Some(layer) = self.layer.as_ref() else {
+                continue;
+            };
+            if &event.surface != layer.wl_surface() {
+                continue;
+            }
+            match event.kind {
+                PointerEventKind::Press { .. } => {
+                    let (x, y) = event.position;
+                    let toolbar_y = self.height.saturating_sub(CONTROL_BAR_HEIGHT) as f64;
+                    if y >= toolbar_y && y < self.height as f64 && x >= 0.0 && x < self.width as f64 {
+                        let segment = (self.width / 3).max(1);
+                        let index = ((x as u32) / segment).min(2);
+                        if let Some(tx) = &self.command_tx {
+                            let command = match index {
+                                0 => RecordingCommand::Save,
+                                1 => RecordingCommand::TogglePause,
+                                _ => RecordingCommand::Discard,
+                            };
+                            let _ = tx.send(command);
+                            if index == 1 {
+                                self.paused = !self.paused;
+                                self.draw(qh);
+                            }
+                        }
+                    }
+                }
+                PointerEventKind::Motion { .. } => {
+                    let (x, y) = event.position;
+                    let toolbar_y = self.height.saturating_sub(CONTROL_BAR_HEIGHT) as f64;
+                    let hover = if y >= toolbar_y && y < self.height as f64 && x >= 0.0 && x < self.width as f64 {
+                        Some((((x as u32) / (self.width / 3).max(1)).min(2)))
+                    } else { None };
+                    if hover != self.hover_button {
+                        self.hover_button = hover;
+                        self.draw(qh);
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    if self.hover_button.take().is_some() {
+                        self.draw(qh);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 delegate_compositor!(RegionBorder);
 delegate_output!(RegionBorder);
 delegate_shm!(RegionBorder);
 delegate_layer!(RegionBorder);
 delegate_seat!(RegionBorder);
 delegate_keyboard!(RegionBorder);
+delegate_pointer!(RegionBorder);
 delegate_registry!(RegionBorder);
 
 impl ProvidesRegistryState for RegionBorder {
@@ -566,6 +687,9 @@ fn run_region_overlay(
         configured: false,
         exit: false,
         keyboard: None,
+        pointer: None,
+        hover_button: None,
+        paused: false,
         ctrl_held: false,
         command_tx,
     };
@@ -603,9 +727,8 @@ fn run_region_overlay(
         // Rather than Exclusive (which would grab the keyboard away from
         // every other app system-wide for as long as the recording runs -
         // defeating the point of recording your normal desktop use), this
-        // border only becomes focused when its own strip is clicked (see
-        // the input region below), so Ctrl+S/Ctrl+Q work without blocking
-        // input to whatever is actually being recorded.
+        // border/toolbar only receives input in its own narrow areas, so
+        // the recorded desktop remains fully interactive.
         KeyboardInteractivity::OnDemand
     } else {
         KeyboardInteractivity::None
@@ -621,16 +744,14 @@ fn run_region_overlay(
 
     let input_region = compositor.wl_compositor().create_region(&qh, ());
     if wants_keyboard {
-        // Only the drawn border strip itself is clickable - the interior
-        // (the actual recorded area) stays click-through, same as the
-        // plain border, so recording still works normally with whatever is
-        // underneath. Clicking the border briefly gives it keyboard focus;
-        // see `KeyboardHandler::press_key` for what Ctrl+S/Ctrl+Q then do.
+        // The selected capture interior stays click-through except for the
+        // narrow toolbar along its bottom edge. Keeping the toolbar inside
+        // the overlay also makes it visible for fullscreen recordings.
         let (w, h, b) = (width as i32, height as i32, border as i32);
-        input_region.add(0, 0, w, b); // top
-        input_region.add(0, h - b, w, b); // bottom
-        input_region.add(0, 0, b, h); // left
-        input_region.add(w - b, 0, b, h); // right
+        input_region.add(0, 0, w, b);
+        input_region.add(0, 0, b, h);
+        input_region.add(w - b, 0, b, h);
+        input_region.add(0, h - CONTROL_BAR_HEIGHT as i32, w, CONTROL_BAR_HEIGHT as i32);
     }
     layer.wl_surface().set_input_region(Some(&input_region));
     layer.commit();
@@ -662,7 +783,7 @@ fn run_region_overlay(
             let _ = guard.read();
         }
 
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(20));
     }
 
     Ok(())
@@ -677,22 +798,10 @@ fn draw_border(canvas: &mut [u8], width: u32, height: u32) {
         REGION_BORDER_COLOR[3],
     ];
 
-    // Top border
     fill_rect(canvas, width, 0, 0, width, border, color);
-    // Bottom border
     fill_rect(canvas, width, 0, height - border, width, border, color);
-    // Left border
     fill_rect(canvas, width, 0, border, border, height - border * 2, color);
-    // Right border
-    fill_rect(
-        canvas,
-        width,
-        width - border,
-        border,
-        border,
-        height - border * 2,
-        color,
-    );
+    fill_rect(canvas, width, width - border, border, border, height - border * 2, color);
 }
 
 fn fill_rect(canvas: &mut [u8], canvas_width: u32, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
