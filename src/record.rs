@@ -444,8 +444,6 @@ fn spawn_ffmpeg(
         &format!("{capture_w}x{capture_h}"),
         "-framerate",
         &fps.to_string(),
-        "-use_wallclock_as_timestamps",
-        "1",
         "-i",
         "-",
     ]);
